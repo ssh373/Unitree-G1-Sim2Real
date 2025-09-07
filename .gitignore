@@ -1,0 +1,9 @@
+*.egg-info
+**/__pycache__/
+*.swp
+build
+.vscode
+*.svg
+*.png
+*.npz
+*.npy
