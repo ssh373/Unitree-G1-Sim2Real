@@ -1,0 +1,6 @@
+*.mak linguist-detectable=false
+*.make linguist-detectable=false
+*.d linguist-detectable=false
+*.Makefile linguist-detectable=false
+*.mf linguist-detectable=false
+*.ipynb linguist-detectable=false

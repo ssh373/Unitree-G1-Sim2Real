@@ -1,120 +1,88 @@
 cmake_minimum_required(VERSION 3.10)
-project(arc_g1)
+project(g1_sim2real LANGUAGES CXX)
 
-# c++17
+# ==== C++ ====
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-# set(CMAKE_BUILD_TYPE Debug)
-# set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g")
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-# detect architecture
-message(STATUS "Detected architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+message(STATUS "System Arch: ${CMAKE_SYSTEM_PROCESSOR}")
 
-# choose the correct lib path based on architecture
+# ==== PATHS ====
+set(UNITREE_SDK2_DIR    ${CMAKE_SOURCE_DIR}/../unitree_sdk2)
+
+set(THIRD_PARTY_DIR     ${CMAKE_SOURCE_DIR}/thirdparty)
+set(YAML_CPP_SRC_DIR    ${THIRD_PARTY_DIR}/yaml-cpp)
+set(ONNXRUNTIME_ROOT    ${THIRD_PARTY_DIR}/onnxruntime)
+set(ONNXRUNTIME_LIB_DIR ${ONNXRUNTIME_ROOT}/build/Release)
+
+# ==== Unitree SDK2 ====
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
-  set(UNITREE_LIB_DIR "${CMAKE_SOURCE_DIR}/../unitree_sdk2-main/lib/x86_64")
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
-  set(UNITREE_LIB_DIR "${CMAKE_SOURCE_DIR}/../unitree_sdk2-main/lib/aarch64")
+  set(UNITREE_LIB_DIR    ${UNITREE_SDK2_DIR}/lib/x86_64)
+  set(UNITREE_3P_LIB_DIR ${UNITREE_SDK2_DIR}/thirdparty/lib/x86_64)
+elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+  set(UNITREE_LIB_DIR    ${UNITREE_SDK2_DIR}/lib/aarch64)
+  set(UNITREE_3P_LIB_DIR ${UNITREE_SDK2_DIR}/thirdparty/lib/aarch64)
 else()
-  message(FATAL_ERROR "Unsupported architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+  message(FATAL_ERROR "Unsupported system arch: ${CMAKE_SYSTEM_PROCESSOR}")
 endif()
 
-# ONNXRUNTIME configuration
-set(ONNXRUNTIME_ROOT "${CMAKE_SOURCE_DIR}/onnxruntime")
+# ==== YAML-CPP ====
+set(YAML_CPP_BUILD_TESTS   OFF CACHE BOOL "" FORCE)
+set(YAML_CPP_BUILD_TOOLS   OFF CACHE BOOL "" FORCE)
+set(YAML_CPP_BUILD_CONTRIB OFF CACHE BOOL "" FORCE)
 
-# YAML configuration
-set(YAML_CPP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/yaml-cpp)
-add_library(yaml-cpp SHARED IMPORTED)
-set_target_properties(yaml-cpp PROPERTIES
-  IMPORTED_LOCATION ${YAML_CPP_DIR}/build/libyaml-cpp.so
-  INTERFACE_INCLUDE_DIRECTORIES ${YAML_CPP_DIR}/include
+if (NOT EXISTS "${YAML_CPP_SRC_DIR}/CMakeLists.txt")
+  message(FATAL_ERROR "yaml-cpp not found: ${YAML_CPP_SRC_DIR}")
+endif()
+add_subdirectory(${YAML_CPP_SRC_DIR})
+
+# ==== ONNXRUNTIME ====
+find_library(ONNXRUNTIME_LIB
+  NAMES onnxruntime
+  HINTS ${ONNXRUNTIME_LIB_DIR}
+  NO_DEFAULT_PATH
+)
+if (NOT ONNXRUNTIME_LIB)
+  message(FATAL_ERROR "onnxruntime not found in: ${ONNXRUNTIME_LIB_DIR}")
+endif()
+
+add_library(onnxruntime SHARED IMPORTED)
+set_target_properties(onnxruntime PROPERTIES
+  IMPORTED_LOCATION "${ONNXRUNTIME_LIB}"
+)
+target_include_directories(onnxruntime INTERFACE
+  "${ONNXRUNTIME_ROOT}/include"
+  "${ONNXRUNTIME_ROOT}/include/onnxruntime/core/session"
 )
 
-# include path
-include_directories(
+# ==== Common Deps ====
+add_library(com_deps INTERFACE)
+target_include_directories(com_deps INTERFACE
   ${CMAKE_SOURCE_DIR}/include
-  ${CMAKE_SOURCE_DIR}/../unitree_sdk2-main/include
-  ${CMAKE_SOURCE_DIR}/../unitree_sdk2-main/thirdparty/include
-  ${CMAKE_SOURCE_DIR}/../unitree_sdk2-main/thirdparty/include/ddscxx
-  ${ONNXRUNTIME_ROOT}/include
-  ${ONNXRUNTIME_ROOT}/include/onnxruntime/core/session
-  ${YAML_CPP_DIR}/include
+  ${UNITREE_SDK2_DIR}/include
+  ${UNITREE_SDK2_DIR}/thirdparty/include
+  ${UNITREE_SDK2_DIR}/thirdparty/include/ddscxx
 )
-
-# link path
-link_directories(
+target_link_directories(com_deps INTERFACE
   ${UNITREE_LIB_DIR}
-  ${CMAKE_SOURCE_DIR}/lib
-  ${ONNXRUNTIME_ROOT}/build_jetson/Release
-  # ${CMAKE_SOURCE_DIR}/../unitree_sdk2-main/thirdparty/lib/x86_64
+  ${UNITREE_3P_LIB_DIR}
+)
+target_link_libraries(com_deps INTERFACE
+  unitree_sdk2
+  ddsc
+  ddscxx
+  pthread
 )
 
-add_library(utils
-  lib/utils.cpp
-)
+# ==== Libs ====
+add_library(utils STATIC lib/utils.cpp)
+target_include_directories(utils PUBLIC ${CMAKE_SOURCE_DIR}/include)
 
-# arc_g1 source
+# ==== Executables ====
 add_executable(g1_arm_example src/g1_arm_example.cpp)
-add_executable(wholebody_rl src/wholebody_rl.cpp)
-add_executable(wholebody_arc src/wholebody_arc.cpp)
-# add_executable(wholebody_arc_29dof src/wholebody_arc_29dof.cpp)
-add_executable(wholebody_korea src/wholebody_korea.cpp)
-add_executable(wholebody_korea_inb src/wholebody_korea_inb.cpp)
+add_executable(wholebody_rl  src/wholebody_rl.cpp)
 
-# link with the sdk library
-target_link_libraries(g1_arm_example
-  unitree_sdk2
-  ddsc
-  ddscxx
-  pthread
-)
-
-target_link_libraries(wholebody_rl
-  utils
-  yaml-cpp
-  unitree_sdk2
-  ddsc
-  ddscxx
-  pthread
-  onnxruntime
-)
-
-target_link_libraries(wholebody_arc
-  utils
-  yaml-cpp
-  unitree_sdk2
-  ddsc
-  ddscxx
-  pthread
-  onnxruntime
-)
-
-# target_link_libraries(wholebody_arc_29dof
-#   utils
-#   yaml-cpp
-#   unitree_sdk2
-#   ddsc
-#   ddscxx
-#   pthread
-#   onnxruntime
-# )
-
-target_link_libraries(wholebody_korea
-  utils
-  yaml-cpp
-  unitree_sdk2
-  ddsc
-  ddscxx
-  pthread
-  onnxruntime
-)
-
-target_link_libraries(wholebody_korea_inb
-  utils
-  yaml-cpp
-  unitree_sdk2
-  ddsc
-  ddscxx
-  pthread
-  onnxruntime
-)
+# ==== Link ====
+target_link_libraries(g1_arm_example PRIVATE com_deps)
+target_link_libraries(wholebody_rl  PRIVATE utils com_deps onnxruntime yaml-cpp)

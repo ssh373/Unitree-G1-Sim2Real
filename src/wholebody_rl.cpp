@@ -1,9 +1,9 @@
 /******************************************************************************************
-* HumARConoid-Sim2Real
+* Unitree-G1 RL Sim2Real
 *
-* Sim2Real Transfer to Optimize Humanoid Locomotion Strategy using Reinforcement Learning
+* Deploy a trained RL locomotion policy (ONNX) on Unitree G1 hardware
 *
-*     https://github.com/S-CHOI-S/HumARConoid-Sim2Real.git
+*     https://github.com/S-CHOI-S/Unitree-G1-Sim2Real.git
 *
 * Advanced Robot Control Lab. (ARC)
 * 	  @ Korea Institute of Science and Technology
@@ -12,56 +12,23 @@
 *
 ******************************************************************************************/
 
-/* Authors: Sol Choi (Jennifer) */
+/* Authors: Sol Choi, Taehyun Kim */
 
-#include "arc_g1/wholebody_rl.hpp"
+#include "g1_sim2real/wholebody_rl.hpp"
 
-const std::array<float, WholeBodyRL::G1_NUM_MOTOR> WholeBodyRL::Kp
-{
-  60, 60, 60, 100, 40, 40,      // left leg
-  60, 60, 60, 100, 40, 40,      // right leg
-  60, 40, 40,                   // waist
-  40, 40, 40, 40,  40, 40, 40,  // left arm
-  40, 40, 40, 40,  40, 40, 40   // right arm
-};
-
-const std::array<float, WholeBodyRL::G1_NUM_MOTOR> WholeBodyRL::Kd
-{
-  1, 1, 1, 2, 1, 1,     // left leg
-  1, 1, 1, 2, 1, 1,     // right leg
-  1, 1, 1,              // waist
-  1, 1, 1, 1, 1, 1, 1,  // left arm
-  1, 1, 1, 1, 1, 1, 1   // right arm
-};
-
-WholeBodyRL::WholeBodyRL(std::string networkInterface, const std::string& model_path)
+WholeBodyRL::WholeBodyRL(const std::string& policy_path)
 : time_(0.0),
-  control_dt_(0.02),
-  duration_(5.0),
+  time_abs(0.0),
+  control_dt_(0.002), // 500Hz
+  command_dt_(0.02), // 50Hz
+  duration_(5.0), // move to default pose
   counter_(0),
   mode_pr_(Mode::PR),
-  mode_machine_(0),
-  input_tensor_values_(num_obs),
-  time_abs(0.0)
+  mode_machine_(0)
 {
-  // initialize unitree channel
-  ChannelFactory::Instance()->Init(0, networkInterface);
-
-  // motion switcher client
-  msc_ = std::make_shared<unitree::robot::b2::MotionSwitcherClient>();
-  msc_->SetTimeout(5.0f);
-  msc_->Init();
-
-  std::string form, name;
-  while (msc_->CheckMode(form, name), !name.empty())
-  {
-    if (msc_->ReleaseMode()) std::cout << "Failed to switch to Release Mode\n";
-    sleep(5);
-  }
-
-  LoadYamlConfig(model_path);
-  LoadOnnxModel(model_path);
-
+  LoadYamlConfig(policy_path);
+  LoadOnnxModel();
+  InitUnitreeChannel();
   InitPublisher();
   InitSubscriber();
   InitThread();
@@ -76,6 +43,28 @@ WholeBodyRL::~WholeBodyRL()
   if (logger_thread_.joinable()) logger_thread_.join();
 }
 
+
+/*****************************************************************************
+** Initialize functions
+*****************************************************************************/
+void WholeBodyRL::InitUnitreeChannel()
+{
+  // initialize unitree channel
+  ChannelFactory::Instance()->Init(0, cfg.networkInterface);
+
+  // motion switcher client
+  msc_ = std::make_shared<unitree::robot::b2::MotionSwitcherClient>();
+  msc_->SetTimeout(5.0f);
+  msc_->Init();
+
+  std::string form, name;
+  while (msc_->CheckMode(form, name), !name.empty())
+  {
+    if (msc_->ReleaseMode()) std::cout << "Failed to switch to Release Mode\n";
+    sleep(5);
+  }
+}
+
 void WholeBodyRL::InitPublisher()
 {
   // create publisher
@@ -87,11 +76,16 @@ void WholeBodyRL::InitSubscriber()
 {
   // create subscriber
   lowstate_subscriber_.reset(new ChannelSubscriber<LowState_>(HG_STATE_TOPIC));
-  lowstate_subscriber_->InitChannel(std::bind(&WholeBodyRL::LowStateHandler, this, std::placeholders::_1), 1);
+  lowstate_subscriber_->InitChannel(std::bind(&WholeBodyRL::LowStateHandler, this, std::placeholders::_1), 1); // 1kHz
+
   imutorso_subscriber_.reset(new ChannelSubscriber<IMUState_>(HG_IMU_TORSO));
-  imutorso_subscriber_->InitChannel(std::bind(&WholeBodyRL::imuTorsoHandler, this, std::placeholders::_1), 1);
+  imutorso_subscriber_->InitChannel(std::bind(&WholeBodyRL::imuTorsoHandler, this, std::placeholders::_1), 1); // 1kHz
 }
 
+
+/*****************************************************************************
+** Thread functions
+*****************************************************************************/
 void WholeBodyRL::InitThread()
 {
   // create threads
@@ -101,19 +95,6 @@ void WholeBodyRL::InitThread()
   monitor_thread_ = std::thread(&WholeBodyRL::MonitorThread, this);
   logger_thread_ = std::thread(&WholeBodyRL::LoggerThread, this); 
 }
-
-// void WholeBodyRL::MonitorThread() 
-// {
-//   while (!should_exit_) 
-//   {
-//     double hz = control_freq_monitor.GetFrequency();
-//     {
-//       std::lock_guard<std::mutex> lock(cout_mutex);
-//       std::cout << "[Monitor] Control loop: " << hz << " Hz\n";
-//     }
-//     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-//   }
-// }
 
 void WholeBodyRL::MonitorThread() 
 {
@@ -125,15 +106,15 @@ void WholeBodyRL::MonitorThread()
     // command writer freq
     double command_writer_hz = command_writer_freq_monitor.GetFrequency();
 
-    if (49.99 <= control_hz && control_hz <= 50.01 && !safe_freq_ &&
-        499.99 <= command_writer_hz && command_writer_hz <= 500.01)
+    if ((1 / command_dt_ - 0.01) <= control_hz && control_hz <= (1 / command_dt_ + 0.01) && !safe_freq_ &&
+        (1 / control_dt_ - 0.01) <= command_writer_hz && command_writer_hz <= (1 / control_dt_ + 0.01))
     {
       safe_freq_ = true;
       std::cout << "\033[32m[Freq Monitor]\033[0m Control freq stable!" 
         << " (Control loop: " << control_hz << " Hz, " << "Command Writer loop: " << command_writer_hz << " Hz)"<< std::endl;
     }
-    else if (49.99 >= control_hz && control_hz >= 50.01 &&
-             499.99 >= command_writer_hz && command_writer_hz >= 500.01)
+    else if ((1 / command_dt_ - 0.01) >= control_hz && control_hz >= (1 / command_dt_ + 0.01) &&
+             (1 / control_dt_ - 0.01) >= command_writer_hz && command_writer_hz >= (1 / control_dt_ + 0.01))
       safe_freq_ = false;
 
     if (!safe_freq_)
@@ -148,7 +129,7 @@ void WholeBodyRL::MonitorThread()
 
 void WholeBodyRL::LoggerThread()
 {
-  std::ofstream log_file("../utility/sources/log_rl.csv");
+  std::ofstream log_file(cfg.log_file);
   if (!log_file.is_open()) 
   {
     std::cerr << "[Logger] Failed to open log.csv" << std::endl;
@@ -158,6 +139,7 @@ void WholeBodyRL::LoggerThread()
   log_file << "time";
   for (int i = 0; i < G1_NUM_MOTOR; ++i) log_file << ",q" << i;
   for (int i = 0; i < G1_NUM_MOTOR; ++i) log_file << ",qdes" << i;
+  for (int i = 0; i < G1_NUM_MOTOR; ++i) log_file << ",qdot" << i;
   for (int i = 0; i < G1_NUM_MOTOR; ++i) log_file << ",tau" << i;
   for (int i = 0; i < G1_NUM_MOTOR; ++i) log_file << ",taudes" << i;
   log_file << "\n";
@@ -173,6 +155,7 @@ void WholeBodyRL::LoggerThread()
       log_file << time_abs;
       for (int i = 0; i < G1_NUM_MOTOR; ++i) log_file << "," << ms->q.at(i);
       for (int i = 0; i < G1_NUM_MOTOR; ++i) log_file << "," << mc->q_target.at(i);
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) log_file << "," << ms->dq.at(i);
       for (int i = 0; i < G1_NUM_MOTOR; ++i) log_file << "," << ms->tau.at(i);
       for (int i = 0; i < G1_NUM_MOTOR; ++i) log_file << "," << cfg.rl_kp.at(i) * (mc->q_target.at(i) - ms->q.at(i)) + cfg.rl_kd.at(i) * (0 - ms->dq.at(i));
       log_file << "\n";
@@ -186,20 +169,33 @@ void WholeBodyRL::LoggerThread()
   std::cout << "[Logger] Stopped logging." << std::endl;
 }
 
+
+/*****************************************************************************
+** Config & Model loading functions
+*****************************************************************************/
 void WholeBodyRL::LoadYamlConfig(const std::string& config_yaml_path)
 {
   YAML::Node config = YAML::LoadFile(config_yaml_path);
 
-  const std::string var_name = "{ARC_G1_POLICY_DIR}";
-  std::string replacement = "../policy";
-
-  std::string model_path = config["onnx_path"].as<std::string>();
-
-  size_t pos = model_path.find(var_name);
-  if (pos != std::string::npos) model_path.replace(pos, var_name.length(), replacement);
+  // network interface
+  cfg.networkInterface = config["network_interface"].as<std::string>();
 
   // onnx path
-  cfg.model_path = model_path;
+  cfg.policy_path = config["policy_path"].as<std::string>();
+
+  // get current time for log file name
+  auto now = std::chrono::system_clock::now();
+  std::time_t t = std::chrono::system_clock::to_time_t(now);
+
+  std::tm tm{};
+  localtime_r(&t, &tm);
+
+  std::ostringstream oss;
+  oss << std::put_time(&tm, "%Y-%m-%d_%H-%M-%S");
+  const std::filesystem::path dir = "../logs/wholebody_rl";
+  std::filesystem::create_directories(dir);
+
+  cfg.log_file = (dir / ("log_" + oss.str() + ".csv")).string();
 
   // default pos
   std::vector<float> default_angles = config["default_angles"].as<std::vector<float>>();
@@ -248,17 +244,17 @@ void WholeBodyRL::LoadYamlConfig(const std::string& config_yaml_path)
   cfg.num_obs = config["num_obs"].as<size_t>();
 
   PrintYamlConfig();
+
+  if (cfg.num_actions != NUM_ACTIONS)
+    throw std::runtime_error("YAML num_actions mismatch with code definition");
+  if (cfg.num_obs != NUM_OBS)
+    throw std::runtime_error("YAML num_obs mismatch with code definition");
 }
 
 void WholeBodyRL::PrintYamlConfig()
 {
   std::cout << "\n============================== [RL Config Loaded] ==============================\n";
-  std::cout << "  Model path       : " << cfg.model_path << "\n";
-
-  std::cout << "  Init Kp size     : " << cfg.init_kp.size() << "\n";
-  std::cout << "  Init Kd size     : " << cfg.init_kd.size() << "\n";
-  std::cout << "  RL Kp size       : " << cfg.rl_kp.size() << "\n";
-  std::cout << "  RL Kd size       : " << cfg.rl_kd.size() << "\n";
+  std::cout << "  Model path       : " << cfg.policy_path << "\n";
 
   std::cout << "  Scale factors:\n";
   std::cout << "    ang_vel_scale  : " << cfg.ang_vel_scale << "\n";
@@ -269,22 +265,19 @@ void WholeBodyRL::PrintYamlConfig()
   std::cout << "    max_cmd        : [" << cfg.max_cmd[0] << ", " << cfg.max_cmd[1] << ", " << cfg.max_cmd[2] << "]\n";
 
   std::cout << "  Model dimensions:\n";
-  std::cout << "    num_actions    : " << cfg.num_actions << "\n";
   std::cout << "    num_obs        : " << cfg.num_obs << "\n";
+  std::cout << "    num_actions    : " << cfg.num_actions << "\n";
   std::cout << "================================================================================\n" << std::endl;
 }
 
-void WholeBodyRL::LoadOnnxModel(const std::string& model_path)
+void WholeBodyRL::LoadOnnxModel()
 {
   // initialize onnx runtime env
   env_ = Ort::Env(ORT_LOGGING_LEVEL_WARNING, "onnx_cpu_RL");
 
   // initialize input data
-  input_data = std::vector<float>(47, 0.0f);
-  input_shape = {1, 47};
-  h_in_data = std::vector<float>(64, 0.0f); 
-  c_in_data = std::vector<float>(64, 0.0f); 
-  hidden_shape = {1, 1, 64};
+  input_data = std::vector<float>(NUM_OBS, 0.0f);
+  input_shape = {1, NUM_OBS};
 
   // session options
   Ort::SessionOptions session_options;
@@ -292,33 +285,25 @@ void WholeBodyRL::LoadOnnxModel(const std::string& model_path)
   session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
 
   // load onnx model
-  session_ = std::make_unique<Ort::Session>(env_, cfg.model_path.c_str(), session_options);
+  session_ = std::make_unique<Ort::Session>(env_, cfg.policy_path.c_str(), session_options);
 
   // Prepare input/output names
   const char* input_name = session_->GetInputName(0, allocator_);
-  const char* h_in_name = session_->GetInputName(1, allocator_);
-  const char* c_in_name = session_->GetInputName(2, allocator_);
   const char* output_name = session_->GetOutputName(0, allocator_);
-  const char* h_out_name = session_->GetOutputName(1, allocator_);
-  const char* c_out_name = session_->GetOutputName(2, allocator_);
 
   // input/output names
-  input_names = {input_name, h_in_name, c_in_name};
-  output_names = {output_name, h_out_name, c_out_name};
+  input_names = {input_name};
+  output_names = {output_name};
 }
 
-void WholeBodyRL::imuTorsoHandler(const void *message) 
-{
-  IMUState_ imu_torso = *(const IMUState_ *)message;
-  auto &rpy = imu_torso.rpy();
-  // if (counter_ % 500 == 0)
-  //   printf("IMU.torso.rpy: %.2f %.2f %.2f\n", rpy[0], rpy[1], rpy[2]);
-}
 
+/*****************************************************************************
+** DDS Callback functions
+*****************************************************************************/
 void WholeBodyRL::LowStateHandler(const void *message)
 {
   LowState_ low_state = *(const LowState_ *)message;
-  if (low_state.crc() != arc_g1::Crc32Core((uint32_t *)&low_state, (sizeof(LowState_) >> 2) - 1)) 
+  if (low_state.crc() != g1_sim2real::Crc32Core((uint32_t *)&low_state, (sizeof(LowState_) >> 2) - 1)) 
   {
     std::cout << "[ERROR] CRC Error" << std::endl;
     return;
@@ -359,6 +344,7 @@ void WholeBodyRL::LowStateHandler(const void *message)
   if (++counter_ % 500 == 0) 
   {
     counter_ = 0;
+
     // IMU
     auto &rpy = low_state.imu_state().rpy();
     // printf("IMU.pelvis.rpy: %.2f %.2f %.2f\n", rpy[0], rpy[1], rpy[2]);
@@ -399,8 +385,22 @@ void WholeBodyRL::LowStateHandler(const void *message)
   }
 }
 
+void WholeBodyRL::imuTorsoHandler(const void *message) 
+{
+  IMUState_ imu_torso = *(const IMUState_ *)message;
+  auto &rpy = imu_torso.rpy();
+  // if (counter_ % 500 == 0)
+  //   printf("IMU.torso.rpy: %.2f %.2f %.2f\n", rpy[0], rpy[1], rpy[2]);
+}
+
+
+/*****************************************************************************
+** DDS Command Writer function
+*****************************************************************************/
 void WholeBodyRL::LowCommandWriter()
 {
+  std::array<float, G1_NUM_MOTOR> torque_des;
+
   command_writer_freq_monitor.Tick();
 
   LowCmd_ dds_low_command;
@@ -408,173 +408,56 @@ void WholeBodyRL::LowCommandWriter()
   dds_low_command.mode_machine() = mode_machine_;
 
   const std::shared_ptr<const MotorCommand> mc = motor_command_buffer_.GetData();
-  if (mc)
+  const std::shared_ptr<const MotorState> ms = motor_state_buffer_.GetData();
+
+  // for upper swing motion
+  const std::shared_ptr<const ImuState> is = imu_state_buffer_.GetData();
+
+  if (mc && ms)
   {
     for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
       dds_low_command.motor_cmd().at(i).mode() = 1;  // 1:Enable, 0:Disable
-      dds_low_command.motor_cmd().at(i).tau() = mc->tau_ff.at(i);
-      dds_low_command.motor_cmd().at(i).q() = mc->q_target.at(i);
-      dds_low_command.motor_cmd().at(i).dq() = mc->dq_target.at(i);
-      dds_low_command.motor_cmd().at(i).kp() = mc->kp.at(i);
-      dds_low_command.motor_cmd().at(i).kd() = mc->kd.at(i);
+      dds_low_command.motor_cmd().at(i).tau()  = mc->tau_ff.at(i);
+      dds_low_command.motor_cmd().at(i).q()    = mc->q_target.at(i);
+      dds_low_command.motor_cmd().at(i).dq()   = mc->dq_target.at(i);
+      dds_low_command.motor_cmd().at(i).kp()   = mc->kp.at(i);
+      dds_low_command.motor_cmd().at(i).kd()   = mc->kd.at(i);
     }
 
-    dds_low_command.crc() = arc_g1::Crc32Core((uint32_t *)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
+    // clamp torque limit
+    for (size_t i = 0; i < NUM_ACTIONS; i++)
+    {
+      torque_des.at(i) = cfg.rl_kp.at(i) * (mc->q_target.at(i) - ms->q.at(i)) + cfg.rl_kd.at(i) * (0 - ms->dq.at(i));
+
+      if (abs(torque_des.at(i)) > torque_limit.at(i))  // torque command
+      {
+        torque_des.at(i) = std::clamp(torque_des.at(i), -torque_limit.at(i), torque_limit.at(i));
+        dds_low_command.motor_cmd().at(i).tau() = torque_des.at(i);
+        dds_low_command.motor_cmd().at(i).q()   = 0;
+        dds_low_command.motor_cmd().at(i).dq()  = 0;
+        dds_low_command.motor_cmd().at(i).kp()  = 0.00001;
+        dds_low_command.motor_cmd().at(i).kd()  = 0.00001;
+      }
+    }
+
+    dds_low_command.crc() = g1_sim2real::Crc32Core((uint32_t *)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
     lowcmd_publisher_->Write(dds_low_command);
   }
+
+  CheckSafetyLimits();
+
   if (should_exit_) std::exit(0);
+
+  if (state_ == State::RL_POLICY_ACTIVE) cnt++;
 }
 
-std::array<float, 3> WholeBodyRL::GetGravityOrientation(const std::array<float, 4>& q)
-{
-  float qw = q[0];
-  float qx = q[1];
-  float qy = q[2];
-  float qz = q[3];
 
-  std::array<float, 3> gravity_orientation;
-
-  gravity_orientation[0] = 2.0f * (-qz * qx + qw * qy);
-  gravity_orientation[1] = -2.0f * (qz * qy + qw * qx);
-  gravity_orientation[2] = 1.0f - 2.0f * (qw * qw + qz * qz);
-
-  return gravity_orientation;
-}
-
-std::vector<float> WholeBodyRL::GetMockObservation()
-{
-  std::vector<float> mock_obs(47, 0.0f);
-  mock_obs[3] = 0.0f;  // gravity x
-  mock_obs[4] = 0.0f;  // gravity y
-  mock_obs[5] = 1.0f;  // gravity z
-
-  mock_obs[9 + LeftKnee] = 0.2f;  // joint pos example
-  return mock_obs;
-}
-
-std::vector<float> WholeBodyRL::GetObservation()
-{
-  const std::shared_ptr<const MotorState> ms = motor_state_buffer_.GetData();
-  const std::shared_ptr<const ImuState> is = imu_state_buffer_.GetData();
-  
-  if (ms && is)
-  {
-    cnt++;
-
-    std::vector<float> obs(47);
-    std::array<float, 3> gravity_orientation = GetGravityOrientation(is->quat);
-    float phase = std::fmod(cnt * control_dt_, period) / period;
-
-    // ang_vel
-    for (int i = 0; i < 3; ++i)
-    {
-      obs[i] = is->omega[i] * cfg.ang_vel_scale;
-    }
-    
-    // projected gravity
-    obs[3] = gravity_orientation[0];
-    obs[4] = gravity_orientation[1];
-    obs[5] = gravity_orientation[2];
-
-    // command
-    obs[6] = static_cast<float>(gamepad_.ly) * cfg.cmd_scale[0] * cfg.max_cmd[0];
-    obs[7] = static_cast<float>(gamepad_.lx) * -1 * cfg.cmd_scale[1] * cfg.max_cmd[1];
-    obs[8] = static_cast<float>(gamepad_.rx) * -1 * cfg.cmd_scale[2] * cfg.max_cmd[2];
-
-    // joint pos
-    for (size_t i = 0; i < cfg.num_actions; ++i) // 12
-    {
-      obs[start_idx + i] = (ms->q[i] - cfg.default_pos[i]) * cfg.dof_pos_scale;
-    }
-
-    // joint vel
-    start_idx += cfg.num_actions;
-    for (size_t i = 0; i < cfg.num_actions; ++i) // 12
-    {
-      obs[start_idx + i] = ms->dq[i] * cfg.dof_vel_scale;
-    }
-
-    // action
-    std::copy(rl_action_.begin(), rl_action_.end(), obs.begin() + start_idx + cfg.num_actions); // 12
-
-    // sin phase
-    obs[45] = std::sin(2.0 * M_PI * phase);
-
-    // cos phase
-    obs[46] = std::cos(2.0 * M_PI * phase);
-
-    start_idx = 9;
-
-    return obs;
-  }
-
-  if (!ms || !is) 
-  {
-    // std::cerr << "[WARNING] Using mock observation." << std::endl;
-    return GetMockObservation();
-  }
-
-  return std::vector<float>(47, 0.0f);
-}
-
-std::array<float, 12> WholeBodyRL::RunInference()
-{
-  // Get observation data
-  input_data = GetObservation();
-
-  // create the input tensor with observation data
-  Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-  Ort::Value input_tensor = Ort::Value::CreateTensor<float>(memory_info, input_data.data(), input_data.size(), input_shape.data(), input_shape.size());
-
-  // create tensors for h_in and c_in
-  Ort::Value h_in_tensor = Ort::Value::CreateTensor<float>(memory_info, h_in_data.data(), h_in_data.size(), hidden_shape.data(), hidden_shape.size());
-  Ort::Value c_in_tensor = Ort::Value::CreateTensor<float>(memory_info, c_in_data.data(), c_in_data.size(), hidden_shape.data(), hidden_shape.size());
-
-  // create input tensors (input_tensor, h_in_tensor, c_in_tensor)
-  input_tensors.clear();
-  input_tensors.push_back(std::move(input_tensor));
-  input_tensors.push_back(std::move(h_in_tensor));
-  input_tensors.push_back(std::move(c_in_tensor));
-
-  // run the inference
-  std::vector<Ort::Value> output_tensors;
-  try 
-  {
-    output_tensors = session_->Run(Ort::RunOptions{nullptr}, input_names.data(), input_tensors.data(), 3, output_names.data(), 3);
-  } 
-  catch (const std::exception& e) 
-  {
-    std::cerr << "Inference failed: " << e.what() << std::endl;
-  }
-
-  // process the output tensor
-  float* output_data = output_tensors[0].GetTensorMutableData<float>();
-  size_t output_size = output_tensors[0].GetTensorTypeAndShapeInfo().GetElementCount();
-
-  float* h_out_data = output_tensors[1].GetTensorMutableData<float>();
-  size_t h_out_size = output_tensors[1].GetTensorTypeAndShapeInfo().GetElementCount();
-
-  float* c_out_data = output_tensors[2].GetTensorMutableData<float>();
-  size_t c_out_size = output_tensors[2].GetTensorTypeAndShapeInfo().GetElementCount();
-
-  // update the h_in and c_in states
-  std::copy(h_out_data, h_out_data + h_out_size, h_in_data.begin());
-  std::copy(c_out_data, c_out_data + c_out_size, c_in_data.begin());
-
-  // convert output data to vector
-  std::vector<float> result(output_data, output_data + output_size);
-
-  // convert result data to array
-  std::array<float, 12> output_action = {};
-  for (size_t i = 0; i < 12; ++i) {
-      output_action[i] = result[i];
-  }
-
-  return output_action;
-}
-
+/*****************************************************************************
+** Control functions
+*****************************************************************************/
 void WholeBodyRL::Control() 
 {
+  // monitor control freq monitor
   control_freq_monitor.Tick();
   
   MotorCommand motor_command_tmp;
@@ -584,35 +467,20 @@ void WholeBodyRL::Control()
   {
     motor_command_tmp.q_target.at(i) = 0.0;
     motor_command_tmp.dq_target.at(i) = 0.0;
-    motor_command_tmp.kp.at(i) = 0; // Kp[i];
-    motor_command_tmp.kd.at(i) = 8; // Kd[i];
+    motor_command_tmp.kp.at(i) = 0;
+    motor_command_tmp.kd.at(i) = 8;
     motor_command_tmp.tau_ff.at(i) = 0.0;
   }
 
-  // auto start = std::chrono::steady_clock::now();
-  // rl_action_ = RunInference();
-  // auto end = std::chrono::steady_clock::now();
-  // double inference_time_ms = std::chrono::duration<double, std::milli>(end - start).count();
-
-  // // 20ms = 50Hz, 1ms = 
-  // if (inference_time_ms > 0.0) std::cerr << "[WARNING] Inference time: " << inference_time_ms << " ms\n";
-
-  // for (int i=0; i<12; ++i)
-  // {
-  //   cout << rl_action_.at(i) << ", ";
-  // }
-  // cout << endl;
-
   if (ms)
   {
-    time_abs += control_dt_;
+    time_abs += command_dt_;
 
     switch (state_) 
     {
       case State::WAIT_FOR_INIT_COMMAND:
       {
-        // printf("G1 is in [WAIT_FOR_INIT_COMMAND] mode!\n");
-        // printf("gamepad_.start.pressed: %d\n", static_cast<int>(gamepad_.start.pressed));
+        // [Stage 0]: set robot to wait for init command
         if (static_cast<int>(gamepad_.start.pressed) == 1)
         {
           std::cout << "[INFO] Start button pressed!" << std::endl;
@@ -624,25 +492,26 @@ void WholeBodyRL::Control()
         {
           motor_command_tmp.q_target.at(i) = ms->q.at(i);
           motor_command_tmp.dq_target.at(i) = 0.0;
-          motor_command_tmp.kp.at(i) = Kp[i];
-          motor_command_tmp.kd.at(i) = Kd[i];
+          motor_command_tmp.kp.at(i) = 0;
+          motor_command_tmp.kd.at(i) = 8;
           motor_command_tmp.tau_ff.at(i) = 0.0;
         }
+
+        CheckSafetyLimits();
         
         break;
       }
 
       case State::MOVING_TO_DEFAULT:
       {
-        logging_active_ = true;
-        time_ += control_dt_;
+        // [Stage 1]: set robot to default posture
+        time_ += command_dt_;
 
         if (time_ < duration_) 
         {
-          // [Stage 1]: set robot to default posture
           for (int i = 0; i < G1_NUM_MOTOR; ++i) 
           {
-            double ratio = std::clamp(time_ / duration_, 0.0, 1.0);
+            double ratio = std::clamp(time_ / duration_, 0.f, 1.f);
             motor_command_tmp.q_target.at(i) = (1.0 - ratio) * ms->q.at(i) + ratio * cfg.default_pos[i];
             motor_command_tmp.kp.at(i) = cfg.init_kp[i];
             motor_command_tmp.kd.at(i) = cfg.init_kd[i];
@@ -660,25 +529,30 @@ void WholeBodyRL::Control()
             motor_command_tmp.kd.at(i) = cfg.init_kd[i];
           }
         }
+
+        CheckSafetyLimits();
+
         break;
       }
 
       case State::WAIT_FOR_POLICY_COMMAND:
       {
-        // std::cout << "================================================================================\n" << std::endl;
-        // printf("G1 is in [WAIT_FOR_POLICY_COMMAND] mode!\n");
-        // std::cout << "[left_leg]:\n" << ms->q.at(0) << ", " << ms->q.at(1) << ", " << ms->q.at(2) << ", " << ms->q.at(3) << ", " << ms->q.at(4) << ", " << ms->q.at(5) << std::endl;
-        // std::cout << "[right_leg]:\n" << ms->q.at(6) << ", " << ms->q.at(7) << ", " << ms->q.at(8) << ", " << ms->q.at(9) << ", " << ms->q.at(10) << ", " << ms->q.at(11) << std::endl;
-        // std::cout << "[waist]:\n" << ms->q.at(12) << ", " << ms->q.at(13) << ", " << ms->q.at(14) << std::endl;
-        // std::cout << "[left_arm]:\n" << ms->q.at(15) << ", " << ms->q.at(16) << ", " << ms->q.at(17) << ", " << ms->q.at(18) << ", " << ms->q.at(19) << ", " << ms->q.at(20) << ", " << ms->q.at(21) << std::endl;
-        // std::cout << "[right_arm]:\n" << ms->q.at(22) << ", " << ms->q.at(23) << ", " << ms->q.at(24) << ", " << ms->q.at(25) << ", " << ms->q.at(26) << ", " << ms->q.at(27) << ", " << ms->q.at(28) << std::endl;
+        // [Stage 2]: set robot to wait for RL command
+        logging_active_ = true;
 
         if (static_cast<int>(gamepad_.A.pressed) == 1)
         {
           time_ = 0.0;
           std::cout << "[INFO] A button pressed!" << std::endl;
           state_ = State::RL_POLICY_ACTIVE;
-          // state_ = State::WAIT_FOR_POLICY_COMMAND;
+        }
+
+        if (static_cast<int>(gamepad_.Y.pressed) == 1)
+        {
+          time_ = 0.0;
+          duration_ = 2.0;
+          std::cout << "[INFO] Y button pressed!" << std::endl;
+          state_ = State::RL_POLICY_WAVE_HAND;
         }
 
         for (int i = 0; i < G1_NUM_MOTOR; ++i)
@@ -688,46 +562,167 @@ void WholeBodyRL::Control()
           motor_command_tmp.kd.at(i) = cfg.init_kd[i];
         }
 
+        CheckSafetyLimits();
+
         break;
       }
 
       case State::RL_POLICY_ACTIVE:
       {
+        // [Stage 3]: run robot with RL policy
+        if (static_cast<int>(gamepad_.select.pressed) == 1)
+        {
+          std::cout << "[INFO] select button pressed!" << std::endl;
+          state_ = State::DAMPING_STATE;
+        }
+
+        if (static_cast<int>(gamepad_.Y.pressed) == 1)
+        {
+          if (command_speed < 0.03)
+          {
+            std::cout << "[INFO] Y button pressed!" << std::endl;
+            state_ = State::RL_POLICY_WAVE_HAND;            
+          }
+        }
+
+        rl_action_ = RunInference();
+
+        mode_pr_ = Mode::PR;
+
+        for (size_t i = 0; i < NUM_ACTIONS; ++i)
+        {
+          int i2m_idx = isaaclab2mujoco[i];
+          motor_command_tmp.q_target[i] = (rl_action_.at(i2m_idx) * cfg.action_scale) + cfg.default_pos[i];
+          motor_command_tmp.kp.at(i) = cfg.rl_kp[i];
+          motor_command_tmp.kd.at(i) = cfg.rl_kd[i];
+        }
+
+        // upper: keep default pose
+        for (size_t i = NUM_ACTIONS; i < G1_NUM_MOTOR; ++i)
+        {
+          motor_command_tmp.q_target[i] = cfg.default_pos[i];
+          motor_command_tmp.kp.at(i) = cfg.init_kp[i];
+          motor_command_tmp.kd.at(i) = cfg.init_kd[i];
+        }
+
+        // for arm swing motion
+        motor_command_tmp.q_target[LeftShoulderPitch] = arm_swing_motion.at(0) + cfg.default_pos[LeftShoulderPitch];
+        motor_command_tmp.q_target[RightShoulderPitch] = arm_swing_motion.at(1) + cfg.default_pos[RightShoulderPitch];
+
+        motor_command_tmp.q_target[LeftElbow] = arm_swing_motion.at(0) + cfg.default_pos[LeftElbow];
+        motor_command_tmp.q_target[RightElbow] = arm_swing_motion.at(1) + cfg.default_pos[RightElbow];
+
+        CheckSafetyLimits();
+
+        break;
+      }
+
+      case State::RL_POLICY_WAVE_HAND:
+      {
+        // [Stage 4]: run robot with RL policy & wave hand
+        time_ += command_dt_;
+
         if (static_cast<int>(gamepad_.select.pressed) == 1)
         {
           std::cout << "[INFO] select button pressed!" << std::endl;
           state_ = State::DAMPING_STATE;
         }
         
-        // auto start = std::chrono::steady_clock::now();
         rl_action_ = RunInference();
-        // auto end = std::chrono::steady_clock::now();
-        // double inference_time_ms = std::chrono::duration<double, std::milli>(end - start).count();
-
-        // 20ms = 50Hz, 1ms = 
-        // if (inference_time_ms > 1.0) std::cerr << "[WARNING] Inference time: " << inference_time_ms << " ms\n";
 
         mode_pr_ = Mode::PR;
 
-        for (size_t i = 0; i < cfg.num_actions; ++i)
+        // lower: RL_POLICY_ACTIVE
+        for (size_t i = 0; i < NUM_ACTIONS; ++i)
         {
-          motor_command_tmp.q_target[i] = (rl_action_.at(i) * cfg.action_scale) + cfg.default_pos[i];
+          int i2m_idx = isaaclab2mujoco[i];
+          motor_command_tmp.q_target[i] = (rl_action_.at(i2m_idx) * cfg.action_scale) + cfg.default_pos[i];
           motor_command_tmp.kp.at(i) = cfg.rl_kp[i];
           motor_command_tmp.kd.at(i) = cfg.rl_kd[i];
         }
-        for (size_t i = cfg.num_actions; i < G1_NUM_MOTOR; ++i)
+
+        // upper: keep default pose
+        for (size_t i = NUM_ACTIONS; i < G1_NUM_MOTOR; ++i)
         {
           motor_command_tmp.q_target[i] = cfg.default_pos[i];
-          motor_command_tmp.kp.at(i) = cfg.rl_kp[i];
-          motor_command_tmp.kd.at(i) = cfg.rl_kd[i];
+          motor_command_tmp.kp.at(i) = cfg.init_kp[i];
+          motor_command_tmp.kd.at(i) = cfg.init_kd[i];
         }
+
+        // upper: WAVE_HAND
+        if (time_ < duration_) 
+        {
+          for (size_t i = 22; i < 26; ++i) 
+          {
+            double ratio = std::clamp(time_ / duration_, 0.f, 1.f);
+            double smooth_ratio = ratio * ratio * (3.0 - 2.0 * ratio);
+            motor_command_tmp.q_target.at(i) = (1.0 - smooth_ratio) * ms->q.at(i) + smooth_ratio * arm_swing_wave_hand_goal[i - 22];
+            motor_command_tmp.kp.at(i) = cfg.rl_kp[i];
+            motor_command_tmp.kd.at(i) = cfg.rl_kd[i];
+          }
+        }
+        else if (time_ < duration_ + wave_duration) // wave_hand & waist yaw
+        {
+          double t_sine = time_ - duration_;
+
+          for (size_t i = 22; i < 26; ++i) 
+          {
+            motor_command_tmp.q_target.at(i) = arm_swing_wave_hand_goal[i - 22];
+            motor_command_tmp.kp.at(i) = cfg.rl_kp[i];
+            motor_command_tmp.kd.at(i) = cfg.rl_kd[i];
+          }
+
+          motor_command_tmp.q_target.at(WaistYaw) = amp * std::sin(omega * t_sine / 3);
+          motor_command_tmp.kp.at(WaistYaw) = cfg.rl_kp[WaistYaw];
+          motor_command_tmp.kd.at(WaistYaw) = cfg.rl_kd[WaistYaw];
+
+          motor_command_tmp.q_target.at(RightShoulderRoll) = arm_swing_wave_hand_goal[1] + amp * (1.0 - std::cos(omega * t_sine));
+          motor_command_tmp.q_target.at(RightElbow) = arm_swing_wave_hand_goal[3] + (amp * 0.5) * (1.0 - std::cos(omega * t_sine));
+        }
+        else if (time_ < duration_ + wave_duration + return_duration) // move to default pose
+        {
+          double ratio = std::clamp((time_ - (duration_ + wave_duration)) / return_duration, 0.f, 1.f);
+          double smooth_ratio = ratio * ratio * (3.0 - 2.0 * ratio);
+
+          for (size_t i = 15; i < 29; ++i)
+          {
+            motor_command_tmp.q_target.at(i) = (1.0 - ratio) * ms->q.at(i) + ratio * cfg.default_pos[i];
+            motor_command_tmp.kp.at(i) = cfg.rl_kp[i];
+            motor_command_tmp.kd.at(i) = cfg.rl_kd[i];
+          }
+
+          motor_command_tmp.q_target.at(WaistYaw) = (1.0 - smooth_ratio) * ms->q.at(WaistYaw) + smooth_ratio * cfg.default_pos[WaistYaw];
+          motor_command_tmp.kp.at(WaistYaw) = cfg.rl_kp[WaistYaw];
+          motor_command_tmp.kd.at(WaistYaw) = cfg.rl_kd[WaistYaw];
+        }
+        else
+        {
+          if (static_cast<int>(gamepad_.A.pressed) == 1)
+          {
+            time_ = 0.0;
+            std::cout << "[INFO] A button pressed! RL_POLICY_ACTIVE" << std::endl;
+            state_ = State::RL_POLICY_ACTIVE;
+          }
+
+          // Not Recommended --------------------------------------------------------------------
+          if (static_cast<int>(gamepad_.X.pressed) == 1)
+          {
+            time_ = 0.0;
+            std::cout << "[INFO] X button pressed! WAIT_FOR_POLICY_COMMAND" << std::endl;
+            state_ = State::WAIT_FOR_POLICY_COMMAND;
+          }
+        }
+
+        CheckSafetyLimits();
 
         break;
       }
 
       case State::DAMPING_STATE:
       {
+        // [Stage 5]: finish robot control
         logging_active_ = false;
+
         for (int i = 0; i < G1_NUM_MOTOR; ++i)
         {
           motor_command_tmp.q_target.at(i) = 0;
@@ -736,6 +731,7 @@ void WholeBodyRL::Control()
           motor_command_tmp.kd.at(i) = 8;
           motor_command_tmp.tau_ff.at(i) = 0;
         }
+
         should_exit_ = true;
 
         break;
@@ -750,15 +746,267 @@ void WholeBodyRL::Control()
   motor_command_buffer_.SetData(motor_command_tmp);
 }
 
+void WholeBodyRL::CheckSafetyLimits()
+{
+  const std::shared_ptr<const MotorState> ms = motor_state_buffer_.GetData();
+
+  if (ms)
+  {
+    for (int i = 0; i < G1_NUM_MOTOR; ++i)
+    {
+      if (ms->q.at(i) < joint_pos_min.at(i) // check joint position limit (min)
+          || ms->q.at(i) > joint_pos_max.at(i) // check joint position limit (max)
+          || abs(ms->tau.at(i)) > torque_limit.at(i) // check joint torque limit
+      )
+      {
+        std::cout<< "\033[31m[ERROR] Motor state limitation Occur! \033[0m\n";
+        std::cout<< "[INFO] State will be changed DAMPING_STATE \n";
+
+        std::cout << " > joint_pos " << i << " : " << ms->q.at(i) << std::endl;
+        std::cout << " > torque    " << i << " : " << ms->tau.at(i) << std::endl;
+
+        state_ = State::DAMPING_STATE;
+        should_exit_=true;
+
+        break;
+      }
+    }
+
+    for (int i = 12; i < G1_NUM_MOTOR; ++i) // for upper body
+    {
+      if (abs(ms->dq.at(i)) > joint_vel_limit) // check joint velocity limit
+      {
+        std::cout<< "\033[31m[ERROR] Motor state limitation Occur! \033[0m\n";
+        std::cout<< "[INFO] State will be changed DAMPING_STATE \n";
+
+        std::cout << " > joint_vel " << i << " : " << ms->dq.at(i) << std::endl;
+
+        state_ = State::DAMPING_STATE;
+        should_exit_=true;
+
+        break;
+      }
+    }
+  }
+}
+
+
+/*****************************************************************************
+** RL functions
+*****************************************************************************/
+std::vector<float> WholeBodyRL::GetObservation()
+{
+  const std::shared_ptr<const MotorState> ms = motor_state_buffer_.GetData();
+  const std::shared_ptr<const ImuState> is = imu_state_buffer_.GetData();
+  
+  if (ms && is)
+  {
+    std::vector<float> obs(NUM_OBS);
+    std::array<float, 3> gravity_orientation = GetGravityOrientation(is->quat);
+
+    // ang_vel
+    for (int i = 0; i < 3; ++i)
+    {
+      obs[i] = is->omega[i] * cfg.ang_vel_scale;
+    }
+    
+    // projected gravity
+    obs[3] = gravity_orientation[0];
+    obs[4] = gravity_orientation[1];
+    obs[5] = gravity_orientation[2];
+
+    // command
+    obs[6] = static_cast<float>(gamepad_.ly) * cfg.cmd_scale[0] * cfg.max_cmd[0];
+    obs[7] = static_cast<float>(gamepad_.lx) * -1 * cfg.cmd_scale[1] * cfg.max_cmd[1];
+    obs[8] = static_cast<float>(gamepad_.rx) * -1 * cfg.cmd_scale[2] * cfg.max_cmd[2];
+
+    if (state_ == State::RL_POLICY_WAVE_HAND)
+    {
+      obs[6] = 0.f;
+      obs[7] = 0.f;
+    }
+
+    // joint pos
+    for (size_t i = 0; i < NUM_ACTIONS; ++i) // NUM_ACTIONS
+    {
+      int m2i_idx = mujoco2isaaclab[i];
+      obs[start_idx + i] = (ms->q[m2i_idx] - cfg.default_pos[m2i_idx]) * cfg.dof_pos_scale;
+    }
+
+    // joint vel
+    start_idx += NUM_ACTIONS;
+    for (size_t i = 0; i < NUM_ACTIONS; ++i) // NUM_ACTIONS
+    {
+      int m2i_idx = mujoco2isaaclab[i];
+      obs[start_idx + i] = ms->dq[m2i_idx] * cfg.dof_vel_scale;
+    }
+
+    // action
+    std::copy(rl_action_.begin(), rl_action_.end(), obs.begin() + start_idx + NUM_ACTIONS); // NUM_ACTIONS
+
+    float cmd_speed = std::sqrt(obs[6] * obs[6] + obs[7] * obs[7]);
+    float stride_length = stride_a + stride_b * cmd_speed;
+    float period = stride_length / (cmd_speed + eps);
+    float phase = std::fmod(cnt * control_dt_, period) / period;
+
+    if (cmd_speed > 0.1)
+    {
+      // sin phase
+      obs[45] = std::sin(2.0 * M_PI * phase);
+
+      // cos phase
+      obs[46] = std::cos(2.0 * M_PI * phase);
+    }
+    else
+    {
+      obs[45] = 0.0f;
+      obs[46] = 0.0f;
+    }
+
+    start_idx = 9;
+
+    // upper: arm swing motion
+    arm_swing_motion = arm_swing_action(phase, cmd_speed, 0.3);
+
+    command_speed = cmd_speed;
+
+    return obs;
+  }
+
+  if (!ms || !is) 
+  {
+    std::cerr << "[ERROR] Failed to make Observation! Change to Damping mode" << std::endl;
+    state_ = State::DAMPING_STATE;
+    should_exit_=true;
+  }
+
+  return std::vector<float>(NUM_OBS, 0.0f);
+}
+
+std::array<float, WholeBodyRL::NUM_ACTIONS> WholeBodyRL::RunInference()
+{
+  // Get observation data
+  input_data = GetObservation();
+
+  // create the input tensor with observation data
+  Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+  Ort::Value input_tensor = Ort::Value::CreateTensor<float>(memory_info, input_data.data(), input_data.size(), input_shape.data(), input_shape.size());
+
+  // create input tensors (input_tensor)
+  input_tensors.clear();
+  input_tensors.push_back(std::move(input_tensor));
+
+  // run the inference
+  std::vector<Ort::Value> output_tensors;
+
+  try 
+  {
+    output_tensors = session_->Run(Ort::RunOptions{nullptr}, input_names.data(), input_tensors.data(), 1, output_names.data(), 1);
+  } 
+  catch (const std::exception& e) 
+  {
+    std::cerr << "Inference failed: " << e.what() << std::endl;
+  }
+
+  // process the output tensor
+  float* output_data = output_tensors[0].GetTensorMutableData<float>();
+  size_t output_size = output_tensors[0].GetTensorTypeAndShapeInfo().GetElementCount();
+
+  // convert output data to vector
+  std::vector<float> result(output_data, output_data + output_size);
+
+  // convert result data to array
+  std::array<float, NUM_ACTIONS> output_action = {};
+  for (size_t i = 0; i < NUM_ACTIONS; ++i) {
+      output_action[i] = result[i];
+  }
+
+  return output_action;
+}
+
+
+/*****************************************************************************
+** Helper functions
+*****************************************************************************/
+std::array<float, 3> WholeBodyRL::GetGravityOrientation(const std::array<float, 4>& q)
+{
+  float qw = q[0];
+  float qx = q[1];
+  float qy = q[2];
+  float qz = q[3];
+
+  std::array<float, 3> gravity_orientation;
+
+  gravity_orientation[0] = 2.0f * (-qz * qx + qw * qy);
+  gravity_orientation[1] = -2.0f * (qz * qy + qw * qx);
+  gravity_orientation[2] = 1.0f - 2.0f * (qw * qw + qz * qz);
+
+  return gravity_orientation;
+}
+
+std::array<float, 3> WholeBodyRL::Quat2RPY(const std::array<float, 4>& q)
+{
+  float qw = q[0];
+  float qx = q[1];
+  float qy = q[2];
+  float qz = q[3];
+
+  std::array<float, 3> rpy;
+
+  rpy[0] = 2.0f * (-qz * qx + qw * qy);
+  rpy[1] = -2.0f * (qz * qy + qw * qx);
+  rpy[2] = 1.0f - 2.0f * (qw * qw + qz * qz);
+
+  float r0 = 2.0f * (qw * qx + qy * qz);
+  float r1 = 1.0f - 2.0f * (qx * qx + qy * qy);
+  rpy[0] = std::atan2(r0, r1);
+
+  float r2 = 2.0f * (qw * qy - qz * qx);
+  r2 = std::clamp(r2, -1.0f, 1.0f);
+  rpy[1] = std::asin(r2);
+
+  float r3 = 2.0f * (qw * qz + qx * qy);
+  float r4 = 1.0f - 2.0f * (qy * qy + qz * qz);
+  rpy[2] = std::atan2(r3, r4);
+
+  return rpy;
+}
+
+std::array<float, 2> WholeBodyRL::arm_swing_action(float leg_phase, float speed, float amplitude)
+{
+  // Anti-phase for arms: shift by 0.5
+  float arm_phase = std::fmod(leg_phase + 0.5, 1.0);
+
+  // Detect double stance phase and apply damping
+  float damping = 1.0f;
+
+  if (0.0 <= leg_phase && leg_phase < 0.1)
+  {
+    damping = 0.5 * (1.0 - std::cos(M_PI * leg_phase / 0.1)); // 0 → 1
+  } 
+  else if (0.5 <= leg_phase && leg_phase < 0.6)
+  {
+    damping = 0.5 * (1.0 + std::cos(M_PI * (leg_phase - 0.5) / 0.1)); // 1 → 0
+  }
+
+  float speed_scale = std::clamp(speed / 0.2, 0.0, 1.0);
+  float arm_angle = amplitude * damping * speed_scale * std::sin(2 * M_PI * arm_phase);
+
+  return {arm_angle, -arm_angle};
+}
+
+
+/*****************************************************************************
+** main function
+*****************************************************************************/
 int main()
 {
-  WholeBodyRL wholebodyrl("eth0", "../configs/g1.yaml");
-  // WholeBodyRL wholebodyrl("wlo1", "../configs/g1.yaml");
+  WholeBodyRL wholebodyrl("../configs/g1_sim2real.yaml");
 
   while (true)
   {
     if (wholebodyrl.should_exit_) break;
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    std::this_thread::sleep_for(std::chrono::microseconds(2000));  // 2ms = 2000μs
   }
 
   return 0;

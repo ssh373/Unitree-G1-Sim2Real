@@ -1,6 +1,6 @@
-#include "arc_g1/utils.hpp"
+#include "g1_sim2real/utils.hpp"
 
-namespace arc_g1 {
+namespace g1_sim2real {
 
 uint32_t Crc32Core(uint32_t *ptr, uint32_t len) {
   uint32_t xbit = 0;
@@ -24,4 +24,4 @@ uint32_t Crc32Core(uint32_t *ptr, uint32_t len) {
   return CRC32;
 }
 
-}  // namespace arc_g1
+}  // namespace g1_sim2real

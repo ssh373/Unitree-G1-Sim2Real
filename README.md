@@ -1,30 +1,40 @@
-# ARC Humanoid Robot G1 Development Extension Template
+# Unitree-G1 Sim2Real Depoly Extension Template
 > [!note]  
-> This extension template is for `unitree_sdk2` and `unitree_sdk2_python`!  
+> This extension template is for `unitree_sdk2`!  
 > **Author**: [_Sol Choi_](https://github.com/S-CHOI-S)
 
 ![alt text](./docs/unitree_g1.png)
 
 
 ## Install
-**Step 1.** clone the repository
+
+**Step 1.** Install Unitree-SDK2
+
+Checkout the detailed installation guide of [Unitree SDK2](https://github.com/unitreerobotics/unitree_sdk2) in this page
+```
 
 ```
-git clone --recursive -b sol_sim2real https://github.com/ARC-KIST/arc_g1.git your_repository_name
+
+**Step 1.** Clone the repository
+
+```
+git clone --recursive  https://github.com/S-CHOI-S/Unitree-G1-Sim2Real.git g1_sim2real
 ```
 
-**Step 2.** create conda environment
+submodule init
+submodule update
+
+**Step 2.** build onnxruntime
 
 ```
 ./arc_g1.sh  # create conda env
-```
-```
-conda activate your_env_name
+git checkout v1.11.0
+./build.sh --config Release --build_shared_lib --parallel --update --build --build_dir build --enable_pybind --disable_ml_ops
 ```
 
-**Step 3.** install dependecies
+**Step 3.** build yaml-cpp
 ```
-./setup_libs.sh  # install dependencies
+cmake .. -DYAML_BUILD_SHARED_LIBS=ON
 ```
 </br>
 
@@ -76,4 +86,4 @@ https://www.docs.quadruped.de/projects/g1/html/index.html
 
 </br></br>
 
-**Last update**: _25.05.09_ [_Sol Choi_](https://github.com/S-CHOI-S)
+**Last update**: _25.12.25_ [_Sol Choi_](https://github.com/S-CHOI-S)
