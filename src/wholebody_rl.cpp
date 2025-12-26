@@ -1,7 +1,7 @@
 /******************************************************************************************
 * Unitree-G1 RL Sim2Real
 *
-* Deploy a trained RL locomotion policy (ONNX) on Unitree G1 hardware
+* Deploy a trained RL locomotion policy on Unitree G1 hardware
 *
 *     https://github.com/S-CHOI-S/Unitree-G1-Sim2Real.git
 *
@@ -110,8 +110,8 @@ void WholeBodyRL::MonitorThread()
         (1 / control_dt_ - 0.01) <= command_writer_hz && command_writer_hz <= (1 / control_dt_ + 0.01))
     {
       safe_freq_ = true;
-      std::cout << "\033[32m[Freq Monitor]\033[0m Control freq stable!" 
-        << " (Control loop: " << control_hz << " Hz, " << "Command Writer loop: " << command_writer_hz << " Hz)"<< std::endl;
+      std::cout << "\033[32m[Freq Monitor]\033[0m Control freq stable!"
+                << " (Control loop: " << control_hz << " Hz, " << "Command Writer loop: " << command_writer_hz << " Hz)" << std::endl;
     }
     else if ((1 / command_dt_ - 0.01) >= control_hz && control_hz >= (1 / command_dt_ + 0.01) &&
              (1 / control_dt_ - 0.01) >= command_writer_hz && command_writer_hz >= (1 / control_dt_ + 0.01))
@@ -130,6 +130,7 @@ void WholeBodyRL::MonitorThread()
 void WholeBodyRL::LoggerThread()
 {
   std::ofstream log_file(cfg.log_file);
+
   if (!log_file.is_open()) 
   {
     std::cerr << "[Logger] Failed to open log.csv" << std::endl;
@@ -183,6 +184,9 @@ void WholeBodyRL::LoadYamlConfig(const std::string& config_yaml_path)
   // onnx path
   cfg.policy_path = config["policy_path"].as<std::string>();
 
+  // log directory
+  cfg.log_dir = config["log_dir"].as<std::string>();
+
   // get current time for log file name
   auto now = std::chrono::system_clock::now();
   std::time_t t = std::chrono::system_clock::to_time_t(now);
@@ -192,7 +196,7 @@ void WholeBodyRL::LoadYamlConfig(const std::string& config_yaml_path)
 
   std::ostringstream oss;
   oss << std::put_time(&tm, "%Y-%m-%d_%H-%M-%S");
-  const std::filesystem::path dir = "../logs/wholebody_rl";
+  const std::filesystem::path dir = "../logs/" + cfg.log_dir;
   std::filesystem::create_directories(dir);
 
   cfg.log_file = (dir / ("log_" + oss.str() + ".csv")).string();
@@ -410,12 +414,10 @@ void WholeBodyRL::LowCommandWriter()
   const std::shared_ptr<const MotorCommand> mc = motor_command_buffer_.GetData();
   const std::shared_ptr<const MotorState> ms = motor_state_buffer_.GetData();
 
-  // for upper swing motion
-  const std::shared_ptr<const ImuState> is = imu_state_buffer_.GetData();
-
   if (mc && ms)
   {
-    for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
+    for (size_t i = 0; i < G1_NUM_MOTOR; i++)
+    {
       dds_low_command.motor_cmd().at(i).mode() = 1;  // 1:Enable, 0:Disable
       dds_low_command.motor_cmd().at(i).tau()  = mc->tau_ff.at(i);
       dds_low_command.motor_cmd().at(i).q()    = mc->q_target.at(i);
@@ -547,14 +549,6 @@ void WholeBodyRL::Control()
           state_ = State::RL_POLICY_ACTIVE;
         }
 
-        if (static_cast<int>(gamepad_.Y.pressed) == 1)
-        {
-          time_ = 0.0;
-          duration_ = 2.0;
-          std::cout << "[INFO] Y button pressed!" << std::endl;
-          state_ = State::RL_POLICY_WAVE_HAND;
-        }
-
         for (int i = 0; i < G1_NUM_MOTOR; ++i)
         {
           motor_command_tmp.q_target.at(i) = cfg.default_pos[i];
@@ -576,15 +570,6 @@ void WholeBodyRL::Control()
           state_ = State::DAMPING_STATE;
         }
 
-        if (static_cast<int>(gamepad_.Y.pressed) == 1)
-        {
-          if (command_speed < 0.03)
-          {
-            std::cout << "[INFO] Y button pressed!" << std::endl;
-            state_ = State::RL_POLICY_WAVE_HAND;            
-          }
-        }
-
         rl_action_ = RunInference();
 
         mode_pr_ = Mode::PR;
@@ -603,114 +588,6 @@ void WholeBodyRL::Control()
           motor_command_tmp.q_target[i] = cfg.default_pos[i];
           motor_command_tmp.kp.at(i) = cfg.init_kp[i];
           motor_command_tmp.kd.at(i) = cfg.init_kd[i];
-        }
-
-        // for arm swing motion
-        motor_command_tmp.q_target[LeftShoulderPitch] = arm_swing_motion.at(0) + cfg.default_pos[LeftShoulderPitch];
-        motor_command_tmp.q_target[RightShoulderPitch] = arm_swing_motion.at(1) + cfg.default_pos[RightShoulderPitch];
-
-        motor_command_tmp.q_target[LeftElbow] = arm_swing_motion.at(0) + cfg.default_pos[LeftElbow];
-        motor_command_tmp.q_target[RightElbow] = arm_swing_motion.at(1) + cfg.default_pos[RightElbow];
-
-        CheckSafetyLimits();
-
-        break;
-      }
-
-      case State::RL_POLICY_WAVE_HAND:
-      {
-        // [Stage 4]: run robot with RL policy & wave hand
-        time_ += command_dt_;
-
-        if (static_cast<int>(gamepad_.select.pressed) == 1)
-        {
-          std::cout << "[INFO] select button pressed!" << std::endl;
-          state_ = State::DAMPING_STATE;
-        }
-        
-        rl_action_ = RunInference();
-
-        mode_pr_ = Mode::PR;
-
-        // lower: RL_POLICY_ACTIVE
-        for (size_t i = 0; i < NUM_ACTIONS; ++i)
-        {
-          int i2m_idx = isaaclab2mujoco[i];
-          motor_command_tmp.q_target[i] = (rl_action_.at(i2m_idx) * cfg.action_scale) + cfg.default_pos[i];
-          motor_command_tmp.kp.at(i) = cfg.rl_kp[i];
-          motor_command_tmp.kd.at(i) = cfg.rl_kd[i];
-        }
-
-        // upper: keep default pose
-        for (size_t i = NUM_ACTIONS; i < G1_NUM_MOTOR; ++i)
-        {
-          motor_command_tmp.q_target[i] = cfg.default_pos[i];
-          motor_command_tmp.kp.at(i) = cfg.init_kp[i];
-          motor_command_tmp.kd.at(i) = cfg.init_kd[i];
-        }
-
-        // upper: WAVE_HAND
-        if (time_ < duration_) 
-        {
-          for (size_t i = 22; i < 26; ++i) 
-          {
-            double ratio = std::clamp(time_ / duration_, 0.f, 1.f);
-            double smooth_ratio = ratio * ratio * (3.0 - 2.0 * ratio);
-            motor_command_tmp.q_target.at(i) = (1.0 - smooth_ratio) * ms->q.at(i) + smooth_ratio * arm_swing_wave_hand_goal[i - 22];
-            motor_command_tmp.kp.at(i) = cfg.rl_kp[i];
-            motor_command_tmp.kd.at(i) = cfg.rl_kd[i];
-          }
-        }
-        else if (time_ < duration_ + wave_duration) // wave_hand & waist yaw
-        {
-          double t_sine = time_ - duration_;
-
-          for (size_t i = 22; i < 26; ++i) 
-          {
-            motor_command_tmp.q_target.at(i) = arm_swing_wave_hand_goal[i - 22];
-            motor_command_tmp.kp.at(i) = cfg.rl_kp[i];
-            motor_command_tmp.kd.at(i) = cfg.rl_kd[i];
-          }
-
-          motor_command_tmp.q_target.at(WaistYaw) = amp * std::sin(omega * t_sine / 3);
-          motor_command_tmp.kp.at(WaistYaw) = cfg.rl_kp[WaistYaw];
-          motor_command_tmp.kd.at(WaistYaw) = cfg.rl_kd[WaistYaw];
-
-          motor_command_tmp.q_target.at(RightShoulderRoll) = arm_swing_wave_hand_goal[1] + amp * (1.0 - std::cos(omega * t_sine));
-          motor_command_tmp.q_target.at(RightElbow) = arm_swing_wave_hand_goal[3] + (amp * 0.5) * (1.0 - std::cos(omega * t_sine));
-        }
-        else if (time_ < duration_ + wave_duration + return_duration) // move to default pose
-        {
-          double ratio = std::clamp((time_ - (duration_ + wave_duration)) / return_duration, 0.f, 1.f);
-          double smooth_ratio = ratio * ratio * (3.0 - 2.0 * ratio);
-
-          for (size_t i = 15; i < 29; ++i)
-          {
-            motor_command_tmp.q_target.at(i) = (1.0 - ratio) * ms->q.at(i) + ratio * cfg.default_pos[i];
-            motor_command_tmp.kp.at(i) = cfg.rl_kp[i];
-            motor_command_tmp.kd.at(i) = cfg.rl_kd[i];
-          }
-
-          motor_command_tmp.q_target.at(WaistYaw) = (1.0 - smooth_ratio) * ms->q.at(WaistYaw) + smooth_ratio * cfg.default_pos[WaistYaw];
-          motor_command_tmp.kp.at(WaistYaw) = cfg.rl_kp[WaistYaw];
-          motor_command_tmp.kd.at(WaistYaw) = cfg.rl_kd[WaistYaw];
-        }
-        else
-        {
-          if (static_cast<int>(gamepad_.A.pressed) == 1)
-          {
-            time_ = 0.0;
-            std::cout << "[INFO] A button pressed! RL_POLICY_ACTIVE" << std::endl;
-            state_ = State::RL_POLICY_ACTIVE;
-          }
-
-          // Not Recommended --------------------------------------------------------------------
-          if (static_cast<int>(gamepad_.X.pressed) == 1)
-          {
-            time_ = 0.0;
-            std::cout << "[INFO] X button pressed! WAIT_FOR_POLICY_COMMAND" << std::endl;
-            state_ = State::WAIT_FOR_POLICY_COMMAND;
-          }
         }
 
         CheckSafetyLimits();
@@ -720,7 +597,7 @@ void WholeBodyRL::Control()
 
       case State::DAMPING_STATE:
       {
-        // [Stage 5]: finish robot control
+        // [Stage 4]: finish robot control
         logging_active_ = false;
 
         for (int i = 0; i < G1_NUM_MOTOR; ++i)
@@ -756,8 +633,7 @@ void WholeBodyRL::CheckSafetyLimits()
     {
       if (ms->q.at(i) < joint_pos_min.at(i) // check joint position limit (min)
           || ms->q.at(i) > joint_pos_max.at(i) // check joint position limit (max)
-          || abs(ms->tau.at(i)) > torque_limit.at(i) // check joint torque limit
-      )
+          || abs(ms->tau.at(i)) > torque_limit.at(i)) // check joint torque limit
       {
         std::cout<< "\033[31m[ERROR] Motor state limitation Occur! \033[0m\n";
         std::cout<< "[INFO] State will be changed DAMPING_STATE \n";
@@ -772,7 +648,7 @@ void WholeBodyRL::CheckSafetyLimits()
       }
     }
 
-    for (int i = 12; i < G1_NUM_MOTOR; ++i) // for upper body
+    for (int i = G1_NUM_LEG_MOTOR; i < G1_NUM_MOTOR; ++i) // for upper body
     {
       if (abs(ms->dq.at(i)) > joint_vel_limit) // check joint velocity limit
       {
@@ -820,12 +696,6 @@ std::vector<float> WholeBodyRL::GetObservation()
     obs[7] = static_cast<float>(gamepad_.lx) * -1 * cfg.cmd_scale[1] * cfg.max_cmd[1];
     obs[8] = static_cast<float>(gamepad_.rx) * -1 * cfg.cmd_scale[2] * cfg.max_cmd[2];
 
-    if (state_ == State::RL_POLICY_WAVE_HAND)
-    {
-      obs[6] = 0.f;
-      obs[7] = 0.f;
-    }
-
     // joint pos
     for (size_t i = 0; i < NUM_ACTIONS; ++i) // NUM_ACTIONS
     {
@@ -865,17 +735,12 @@ std::vector<float> WholeBodyRL::GetObservation()
 
     start_idx = 9;
 
-    // upper: arm swing motion
-    arm_swing_motion = arm_swing_action(phase, cmd_speed, 0.3);
-
-    command_speed = cmd_speed;
-
     return obs;
   }
 
   if (!ms || !is) 
   {
-    std::cerr << "[ERROR] Failed to make Observation! Change to Damping mode" << std::endl;
+    std::cerr << "[ERROR] Failed to make Observation! Change to Damping mode!" << std::endl;
     state_ = State::DAMPING_STATE;
     should_exit_=true;
   }
@@ -917,8 +782,9 @@ std::array<float, WholeBodyRL::NUM_ACTIONS> WholeBodyRL::RunInference()
 
   // convert result data to array
   std::array<float, NUM_ACTIONS> output_action = {};
-  for (size_t i = 0; i < NUM_ACTIONS; ++i) {
-      output_action[i] = result[i];
+  for (size_t i = 0; i < NUM_ACTIONS; ++i)
+  {
+    output_action[i] = result[i];
   }
 
   return output_action;
@@ -970,29 +836,6 @@ std::array<float, 3> WholeBodyRL::Quat2RPY(const std::array<float, 4>& q)
   rpy[2] = std::atan2(r3, r4);
 
   return rpy;
-}
-
-std::array<float, 2> WholeBodyRL::arm_swing_action(float leg_phase, float speed, float amplitude)
-{
-  // Anti-phase for arms: shift by 0.5
-  float arm_phase = std::fmod(leg_phase + 0.5, 1.0);
-
-  // Detect double stance phase and apply damping
-  float damping = 1.0f;
-
-  if (0.0 <= leg_phase && leg_phase < 0.1)
-  {
-    damping = 0.5 * (1.0 - std::cos(M_PI * leg_phase / 0.1)); // 0 → 1
-  } 
-  else if (0.5 <= leg_phase && leg_phase < 0.6)
-  {
-    damping = 0.5 * (1.0 + std::cos(M_PI * (leg_phase - 0.5) / 0.1)); // 1 → 0
-  }
-
-  float speed_scale = std::clamp(speed / 0.2, 0.0, 1.0);
-  float arm_angle = amplitude * damping * speed_scale * std::sin(2 * M_PI * arm_phase);
-
-  return {arm_angle, -arm_angle};
 }
 
 

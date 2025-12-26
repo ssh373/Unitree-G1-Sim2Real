@@ -1,7 +1,7 @@
 /******************************************************************************************
 * Unitree-G1 RL Sim2Real
 *
-* Deploy a trained RL locomotion policy (ONNX) on Unitree G1 hardware
+* Deploy a trained RL locomotion policy on Unitree G1 hardware
 *
 *     https://github.com/S-CHOI-S/Unitree-G1-Sim2Real.git
 *

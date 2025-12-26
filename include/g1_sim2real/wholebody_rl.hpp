@@ -1,7 +1,7 @@
 /******************************************************************************************
 * Unitree-G1 RL Sim2Real
 *
-* Deploy a trained RL locomotion policy (ONNX) on Unitree G1 hardware
+* Deploy a trained RL locomotion policy on Unitree G1 hardware
 *
 *     https://github.com/S-CHOI-S/Unitree-G1-Sim2Real.git
 *
@@ -74,6 +74,8 @@ class WholeBodyRL {
   ** Define variables
   *****************************************************************************/
   static const int G1_NUM_MOTOR = 29;
+  static const int G1_NUM_LEG_MOTOR = 12;
+  static const int G1_NUM_UPPER_MOTOR = G1_NUM_MOTOR - G1_NUM_LEG_MOTOR;
 
   static const size_t NUM_OBS = 47;
   static const size_t NUM_ACTIONS = 12;
@@ -109,7 +111,6 @@ class WholeBodyRL {
     MOVING_TO_DEFAULT,
     WAIT_FOR_POLICY_COMMAND,
     RL_POLICY_ACTIVE,
-    RL_POLICY_WAVE_HAND,
     DAMPING_STATE
   };
   
@@ -188,7 +189,6 @@ class WholeBodyRL {
   static constexpr std::array<int, NUM_ACTIONS> isaaclab2mujoco = 
   {
     0, 2, 4, 6, 8, 10, 1, 3, 5, 7, 9, 11
-
   };
 
   // mujoco2isaaclab
@@ -228,7 +228,6 @@ class WholeBodyRL {
     25, 25, 25, 25, 25, 5, 5
   };
 
-
   // control state
   std::mutex cout_mutex;
   State state_ = State::WAIT_FOR_INIT_COMMAND;
@@ -240,16 +239,6 @@ class WholeBodyRL {
   float eps = 1e-07;
   size_t start_idx = 9;
   std::array<float, NUM_ACTIONS> rl_action_ = {};
-
-  // RL_POLICY_WAVE_HAND
-  std::array<float, 2> arm_swing_motion = {};
-  std::array<float, 4> arm_swing_wave_hand_goal = {0.1, -1.75, -1.5, -0.5};
-  float command_speed = 0.f;
-  float wave_duration = 12.f;
-  float return_duration = 8.f;
-  float amp = 0.4;
-  float freq = 0.5;
-  float omega = 2 * M_PI * freq;
 
   /*****************************************************************************
   ** Define functions
@@ -287,17 +276,16 @@ class WholeBodyRL {
   // Helper functions
   std::array<float, 3> GetGravityOrientation(const std::array<float, 4>& q);
   std::array<float, 3> Quat2RPY(const std::array<float, 4>& q);
-  std::array<float, 2> arm_swing_action(float leg_phase, float speed, float amplitude);
 
   /*****************************************************************************
   ** Define structure & data buffer
   *****************************************************************************/
- struct MotorState
- {
-   std::array<float, G1_NUM_MOTOR> q = {};
-   std::array<float, G1_NUM_MOTOR> dq = {};
-   std::array<float, G1_NUM_MOTOR> tau = {};
- };
+  struct MotorState
+  {
+    std::array<float, G1_NUM_MOTOR> q = {};
+    std::array<float, G1_NUM_MOTOR> dq = {};
+    std::array<float, G1_NUM_MOTOR> tau = {};
+  };
 
   struct ImuState
   {
@@ -319,6 +307,7 @@ class WholeBodyRL {
   {
     std::string networkInterface;
     std::string policy_path;
+    std::string log_dir;
     std::string log_file;
     std::array<float, G1_NUM_MOTOR> default_pos = {};
     std::array<float, G1_NUM_MOTOR> rl_kp = {};

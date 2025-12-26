@@ -1,6 +1,16 @@
 Changelog
 =========
 
+2025-12-26
+----------
+
+Changed
+~~~~~~~
+- 필요없는 내용, 변수들 정리 및 하드코딩 최소화
+  - RL_POLICY_WAVE_HAND 관련 코드 제거
+  - G1_NUM_MOTOR 상수 분리(G1_NUM_LEG_MOTOR, G1_NUM_UPPER_MOTOR)
+
+
 2025-12-25
 ----------
 

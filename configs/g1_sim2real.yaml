@@ -1,7 +1,7 @@
 # ******************************************************************************************
 #  Unitree-G1 RL Sim2Real
 # 
-#  Deploy a trained RL locomotion policy (ONNX) on Unitree G1 hardware
+#  Deploy a trained RL locomotion policy on Unitree G1 hardware
 # 
 #      https://github.com/S-CHOI-S/Unitree-G1-Sim2Real.git
 # 
@@ -19,6 +19,7 @@ network_interface: "eno1" # eth0
 
 # Path to the RL policy
 policy_path: "../policy/sol/0819/policy.onnx"
+log_dir: "wholebody_rl"
 
 # Initial joint angles & RL default joint angles
 default_angles: [ -0.10, 0., 0., 0.3, -0.2, 0.,
