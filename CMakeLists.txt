@@ -1,12 +1,18 @@
 cmake_minimum_required(VERSION 3.10)
-project(g1_sim2real LANGUAGES CXX)
+project(g1_sim2real 
+  VERSION 1.0.0
+  DESCRIPTION "Unitree G1 RL Sim2Real Deployment"
+  LANGUAGES CXX
+)
 
-# ==== C++ ====
+# ==== C++ Standard ====
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+message(STATUS "=== ${PROJECT_NAME} v${PROJECT_VERSION} ===")
 message(STATUS "System Arch: ${CMAKE_SYSTEM_PROCESSOR}")
+message(STATUS "C++ Standard: ${CMAKE_CXX_STANDARD}")
 
 # ==== PATHS ====
 set(UNITREE_SDK2_DIR    ${CMAKE_SOURCE_DIR}/../unitree_sdk2)

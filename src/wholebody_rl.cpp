@@ -19,8 +19,8 @@
 WholeBodyRL::WholeBodyRL(const std::string& policy_path)
 : time_(0.0),
   time_abs(0.0),
-  control_dt_(0.002), // 500Hz
-  command_dt_(0.02), // 50Hz
+  control_dt_(CONTROL_DT), // 500Hz
+  command_dt_(COMMAND_DT), // 50Hz
   duration_(5.0), // move to default pose
   counter_(0),
   mode_pr_(Mode::PR),
@@ -76,10 +76,10 @@ void WholeBodyRL::InitSubscriber()
 {
   // create subscriber
   lowstate_subscriber_.reset(new ChannelSubscriber<LowState_>(HG_STATE_TOPIC));
-  lowstate_subscriber_->InitChannel(std::bind(&WholeBodyRL::LowStateHandler, this, std::placeholders::_1), 1); // 1kHz
+  lowstate_subscriber_->InitChannel(std::bind(&WholeBodyRL::LowStateHandler, this, std::placeholders::_1), 1);
 
   imutorso_subscriber_.reset(new ChannelSubscriber<IMUState_>(HG_IMU_TORSO));
-  imutorso_subscriber_->InitChannel(std::bind(&WholeBodyRL::imuTorsoHandler, this, std::placeholders::_1), 1); // 1kHz
+  imutorso_subscriber_->InitChannel(std::bind(&WholeBodyRL::imuTorsoHandler, this, std::placeholders::_1), 1);
 }
 
 
@@ -89,8 +89,8 @@ void WholeBodyRL::InitSubscriber()
 void WholeBodyRL::InitThread()
 {
   // create threads
-  command_writer_ptr_ = CreateRecurrentThreadEx("command_writer", UT_CPU_ID_NONE, 2000, &WholeBodyRL::LowCommandWriter, this); // 500Hz
-  control_thread_ptr_ = CreateRecurrentThreadEx("control", UT_CPU_ID_NONE, 20000, &WholeBodyRL::Control, this); // 50Hz
+  command_writer_ptr_ = CreateRecurrentThreadEx("command_writer", UT_CPU_ID_NONE, COMMAND_WRITER_PERIOD_US, &WholeBodyRL::LowCommandWriter, this); // 500Hz
+  control_thread_ptr_ = CreateRecurrentThreadEx("control", UT_CPU_ID_NONE, CONTROL_LOOP_PERIOD_US, &WholeBodyRL::Control, this); // 50Hz
 
   monitor_thread_ = std::thread(&WholeBodyRL::MonitorThread, this);
   logger_thread_ = std::thread(&WholeBodyRL::LoggerThread, this); 
@@ -176,83 +176,95 @@ void WholeBodyRL::LoggerThread()
 *****************************************************************************/
 void WholeBodyRL::LoadYamlConfig(const std::string& config_yaml_path)
 {
-  YAML::Node config = YAML::LoadFile(config_yaml_path);
-
-  // network interface
-  cfg.networkInterface = config["network_interface"].as<std::string>();
-
-  // onnx path
-  cfg.policy_path = config["policy_path"].as<std::string>();
-
-  // log directory
-  cfg.log_dir = config["log_dir"].as<std::string>();
-
-  // get current time for log file name
-  auto now = std::chrono::system_clock::now();
-  std::time_t t = std::chrono::system_clock::to_time_t(now);
-
-  std::tm tm{};
-  localtime_r(&t, &tm);
-
-  std::ostringstream oss;
-  oss << std::put_time(&tm, "%Y-%m-%d_%H-%M-%S");
-  const std::filesystem::path dir = "../logs/" + cfg.log_dir;
-  std::filesystem::create_directories(dir);
-
-  cfg.log_file = (dir / ("log_" + oss.str() + ".csv")).string();
-
-  // default pos
-  std::vector<float> default_angles = config["default_angles"].as<std::vector<float>>();
-  std::vector<float> arm_waist_target = config["arm_waist_target"].as<std::vector<float>>();
-  if (default_angles.size() + arm_waist_target.size() != G1_NUM_MOTOR) throw std::runtime_error("YAML default_angles + arm_waist_target size mismatch");
-  std::copy(default_angles.begin(), default_angles.end(), cfg.default_pos.begin());
-  std::copy(arm_waist_target.begin(), arm_waist_target.end(), cfg.default_pos.begin() + default_angles.size());
-
-  // init kp
-  std::vector<float> init_leg_kps = config["init_leg_kps"].as<std::vector<float>>();
-  std::vector<float> init_arm_waist_kps = config["init_arm_waist_kps"].as<std::vector<float>>();
-  if (init_leg_kps.size() + init_arm_waist_kps.size() != G1_NUM_MOTOR) throw std::runtime_error("YAML init_leg_kps + init_arm_waist_kps size mismatch");
-  std::copy(init_leg_kps.begin(), init_leg_kps.end(), cfg.init_kp.begin());
-  std::copy(init_arm_waist_kps.begin(), init_arm_waist_kps.end(), cfg.init_kp.begin() + init_leg_kps.size());
-
-  // init kd
-  std::vector<float> init_leg_kds = config["init_leg_kds"].as<std::vector<float>>();
-  std::vector<float> init_arm_waist_kds = config["init_arm_waist_kds"].as<std::vector<float>>();
-  if (init_leg_kds.size() + init_arm_waist_kds.size() != G1_NUM_MOTOR) throw std::runtime_error("YAML init_leg_kds + init_arm_waist_kds size mismatch");
-  std::copy(init_leg_kds.begin(), init_leg_kds.end(), cfg.init_kd.begin());
-  std::copy(init_arm_waist_kds.begin(), init_arm_waist_kds.end(), cfg.init_kd.begin() + init_leg_kds.size());
-
-  // RL kp
-  std::vector<float> kps = config["kps"].as<std::vector<float>>();
-  std::vector<float> arm_kps = config["arm_waist_kps"].as<std::vector<float>>();
-  if (kps.size() + arm_kps.size() != G1_NUM_MOTOR) throw std::runtime_error("YAML kps + arm_waist_kps size mismatch");
-  std::copy(kps.begin(), kps.end(), cfg.rl_kp.begin());
-  std::copy(arm_kps.begin(), arm_kps.end(), cfg.rl_kp.begin() + kps.size());
-
-  // RL kd
-  std::vector<float> kds = config["kds"].as<std::vector<float>>();
-  std::vector<float> arm_kds = config["arm_waist_kds"].as<std::vector<float>>();
-  if (kds.size() + arm_kds.size() != G1_NUM_MOTOR) throw std::runtime_error("YAML kds + arm_waist_kds size mismatch");
-  std::copy(kds.begin(), kds.end(), cfg.rl_kd.begin());
-  std::copy(arm_kds.begin(), arm_kds.end(), cfg.rl_kd.begin() + kds.size());
-
-  cfg.ang_vel_scale = config["ang_vel_scale"].as<float>();
-  cfg.dof_pos_scale = config["dof_pos_scale"].as<float>();
-  cfg.dof_vel_scale = config["dof_vel_scale"].as<float>();
-  cfg.action_scale = config["action_scale"].as<float>();
-  std::vector<float> cmd_scale = config["cmd_scale"].as<std::vector<float>>();
-  std::copy(cmd_scale.begin(), cmd_scale.end(), cfg.cmd_scale.begin());
-  std::vector<float> max_cmd = config["max_cmd"].as<std::vector<float>>();
-  std::copy(max_cmd.begin(), max_cmd.end(), cfg.max_cmd.begin());
-  cfg.num_actions = config["num_actions"].as<size_t>();
-  cfg.num_obs = config["num_obs"].as<size_t>();
-
-  PrintYamlConfig();
-
-  if (cfg.num_actions != NUM_ACTIONS)
-    throw std::runtime_error("YAML num_actions mismatch with code definition");
-  if (cfg.num_obs != NUM_OBS)
-    throw std::runtime_error("YAML num_obs mismatch with code definition");
+  try
+  {
+    // load yaml file
+    if (!std::filesystem::exists(config_yaml_path))
+      throw std::runtime_error("Config file not found: " + config_yaml_path);
+    
+    YAML::Node config = YAML::LoadFile(config_yaml_path);
+    
+    if (!config["network_interface"])
+      throw std::runtime_error("Missing required field: network_interface");
+    
+    // network interface
+    cfg.networkInterface = config["network_interface"].as<std::string>();
+    
+    // onnx path
+    cfg.policy_path = config["policy_path"].as<std::string>();
+    
+    // log directory
+    cfg.log_dir = config["log_dir"].as<std::string>();
+    
+    // get current time for log file name
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    
+    std::tm tm{};
+    localtime_r(&t, &tm);
+    
+    std::ostringstream oss;
+    oss << std::put_time(&tm, "%Y-%m-%d_%H-%M-%S");
+    const std::filesystem::path dir = "../logs/" + cfg.log_dir;
+    std::filesystem::create_directories(dir);
+    
+    cfg.log_file = (dir / ("log_" + oss.str() + ".csv")).string();
+    
+    // default pos
+    std::vector<float> default_angles = config["default_angles"].as<std::vector<float>>();
+    std::vector<float> arm_waist_target = config["arm_waist_target"].as<std::vector<float>>();
+    if (default_angles.size() + arm_waist_target.size() != G1_NUM_MOTOR)
+      throw std::runtime_error("YAML default_angles + arm_waist_target size mismatch");
+    std::copy(default_angles.begin(), default_angles.end(), cfg.default_pos.begin());
+    std::copy(arm_waist_target.begin(), arm_waist_target.end(), cfg.default_pos.begin() + default_angles.size());
+    
+    // init kp
+    std::vector<float> init_leg_kps = config["init_leg_kps"].as<std::vector<float>>();
+    std::vector<float> init_arm_waist_kps = config["init_arm_waist_kps"].as<std::vector<float>>();
+    if (init_leg_kps.size() + init_arm_waist_kps.size() != G1_NUM_MOTOR)
+      throw std::runtime_error("YAML init_leg_kps + init_arm_waist_kps size mismatch");
+    std::copy(init_leg_kps.begin(), init_leg_kps.end(), cfg.init_kp.begin());
+    std::copy(init_arm_waist_kps.begin(), init_arm_waist_kps.end(), cfg.init_kp.begin() + init_leg_kps.size());
+    
+    // init kd
+    std::vector<float> init_leg_kds = config["init_leg_kds"].as<std::vector<float>>();
+    std::vector<float> init_arm_waist_kds = config["init_arm_waist_kds"].as<std::vector<float>>();
+    if (init_leg_kds.size() + init_arm_waist_kds.size() != G1_NUM_MOTOR)
+      throw std::runtime_error("YAML init_leg_kds + init_arm_waist_kds size mismatch");
+    std::copy(init_leg_kds.begin(), init_leg_kds.end(), cfg.init_kd.begin());
+    std::copy(init_arm_waist_kds.begin(), init_arm_waist_kds.end(), cfg.init_kd.begin() + init_leg_kds.size());
+    
+    // RL kp
+    std::vector<float> kps = config["kps"].as<std::vector<float>>();
+    std::vector<float> arm_kps = config["arm_waist_kps"].as<std::vector<float>>();
+    if (kps.size() + arm_kps.size() != G1_NUM_MOTOR)
+      throw std::runtime_error("YAML kps + arm_waist_kps size mismatch");
+    std::copy(kps.begin(), kps.end(), cfg.rl_kp.begin());
+    std::copy(arm_kps.begin(), arm_kps.end(), cfg.rl_kp.begin() + kps.size());
+    
+    // RL kd
+    std::vector<float> kds = config["kds"].as<std::vector<float>>();
+    std::vector<float> arm_kds = config["arm_waist_kds"].as<std::vector<float>>();
+    if (kds.size() + arm_kds.size() != G1_NUM_MOTOR)
+      throw std::runtime_error("YAML kds + arm_waist_kds size mismatch");
+    std::copy(kds.begin(), kds.end(), cfg.rl_kd.begin());
+    std::copy(arm_kds.begin(), arm_kds.end(), cfg.rl_kd.begin() + kds.size());
+    
+    cfg.ang_vel_scale = config["ang_vel_scale"].as<float>();
+    cfg.dof_pos_scale = config["dof_pos_scale"].as<float>();
+    cfg.dof_vel_scale = config["dof_vel_scale"].as<float>();
+    cfg.action_scale = config["action_scale"].as<float>();
+    std::vector<float> cmd_scale = config["cmd_scale"].as<std::vector<float>>();
+    std::copy(cmd_scale.begin(), cmd_scale.end(), cfg.cmd_scale.begin());
+    std::vector<float> max_cmd = config["max_cmd"].as<std::vector<float>>();
+    std::copy(max_cmd.begin(), max_cmd.end(), cfg.max_cmd.begin());
+    
+    PrintYamlConfig();
+  }
+  catch (const std::exception& e)
+  {
+    throw std::runtime_error("Failed to load config: " + std::string(e.what()));
+  }
 }
 
 void WholeBodyRL::PrintYamlConfig()
@@ -269,8 +281,8 @@ void WholeBodyRL::PrintYamlConfig()
   std::cout << "    max_cmd        : [" << cfg.max_cmd[0] << ", " << cfg.max_cmd[1] << ", " << cfg.max_cmd[2] << "]\n";
 
   std::cout << "  Model dimensions:\n";
-  std::cout << "    num_obs        : " << cfg.num_obs << "\n";
-  std::cout << "    num_actions    : " << cfg.num_actions << "\n";
+  std::cout << "    num_obs        : " << NUM_OBS<< "\n";
+  std::cout << "    num_actions    : " << NUM_ACTIONS << "\n";
   std::cout << "================================================================================\n" << std::endl;
 }
 

@@ -73,12 +73,22 @@ class WholeBodyRL {
   /*****************************************************************************
   ** Define variables
   *****************************************************************************/
+  // Robot Configuration
   static const int G1_NUM_MOTOR = 29;
   static const int G1_NUM_LEG_MOTOR = 12;
   static const int G1_NUM_UPPER_MOTOR = G1_NUM_MOTOR - G1_NUM_LEG_MOTOR;
 
+  // RL Configuration
   static const size_t NUM_OBS = 47;
   static const size_t NUM_ACTIONS = 12;
+
+  // Control Frequencies (in seconds)
+  static constexpr float CONTROL_DT = 0.002f;  // 500Hz
+  static constexpr float COMMAND_DT = 0.02f;   // 50Hz
+  
+  // Thread Timing Configuration (in microseconds)
+  static constexpr int COMMAND_WRITER_PERIOD_US = CONTROL_DT * 1000000;  // 500Hz (0.002s)
+  static constexpr int CONTROL_LOOP_PERIOD_US = COMMAND_DT * 1000000;    // 50Hz (0.02s)
 
   std::atomic<bool> should_exit_ = false;
   std::atomic<bool> logging_active_ = false;
@@ -93,11 +103,14 @@ class WholeBodyRL {
   *****************************************************************************/
   std::shared_ptr<unitree::robot::b2::MotionSwitcherClient> msc_;
   
+  // Robot state publisher
   ChannelPublisherPtr<LowCmd_> lowcmd_publisher_;
 
+  // Robot state subscriber
   ChannelSubscriberPtr<LowState_> lowstate_subscriber_;
   ChannelSubscriberPtr<IMUState_> imutorso_subscriber_;
 
+  // Threads
   ThreadPtr command_writer_ptr_, control_thread_ptr_;
   std::thread monitor_thread_;
   std::thread logger_thread_;
@@ -105,6 +118,7 @@ class WholeBodyRL {
   /*****************************************************************************
   ** Define enum class
   *****************************************************************************/
+  // Robot Control States
   enum class State 
   {
     WAIT_FOR_INIT_COMMAND,
@@ -114,12 +128,14 @@ class WholeBodyRL {
     DAMPING_STATE
   };
   
+  // Robot Control Modes (PR/AB for ankle joints)
   enum class Mode 
   {
     PR = 0,  // Series Control for Pitch/Roll Joints
     AB = 1   // Parallel Control for A/B Joints
   };
 
+  // Robot Joint Indices
   enum G1JointIndex 
   {
     LeftHipPitch = 0,
@@ -156,13 +172,13 @@ class WholeBodyRL {
   /*****************************************************************************
   ** Define variables
   *****************************************************************************/
-  float time_, time_abs;
-  float control_dt_;  // [2ms]: 500hz
-  float command_dt_;  // [20ms]: 50hz
-  float duration_;    // [5 s]
-  int counter_;
-  Mode mode_pr_;
-  uint8_t mode_machine_;
+  uint8_t mode_machine_;      // robot model
+  Mode mode_pr_;              // control mode for ankle joints
+  float time_, time_abs;      // time trackers
+  float control_dt_;          // [2ms]: 500hz
+  float command_dt_;          // [20ms]: 50hz
+  float duration_;            // [5 s]: duration to move to default pose
+  int counter_;               // control loop counter (terminal info)
   std::atomic<bool> safe_freq_ = false;
 
   // Gamepad (joystick)
@@ -280,6 +296,36 @@ class WholeBodyRL {
   /*****************************************************************************
   ** Define structure & data buffer
   *****************************************************************************/
+  struct YamlConfig
+  {
+    std::string networkInterface;
+    std::string policy_path;
+    std::string log_dir;
+    std::string log_file;
+    std::array<float, G1_NUM_MOTOR> default_pos = {};
+    std::array<float, G1_NUM_MOTOR> rl_kp = {};
+    std::array<float, G1_NUM_MOTOR> rl_kd = {};
+    std::array<float, G1_NUM_MOTOR> init_kp = {};
+    std::array<float, G1_NUM_MOTOR> init_kd = {};
+    // size_t num_obs;
+    // size_t num_actions;
+    float ang_vel_scale;
+    float dof_pos_scale;
+    float dof_vel_scale;
+    float action_scale;
+    std::array<float, 3> cmd_scale = {};
+    std::array<float, 3> max_cmd = {};
+  };
+
+  struct MotorCommand
+  {
+    std::array<float, G1_NUM_MOTOR> q_target = {};
+    std::array<float, G1_NUM_MOTOR> dq_target = {};
+    std::array<float, G1_NUM_MOTOR> kp = {};
+    std::array<float, G1_NUM_MOTOR> kd = {};
+    std::array<float, G1_NUM_MOTOR> tau_ff = {};
+  };
+  
   struct MotorState
   {
     std::array<float, G1_NUM_MOTOR> q = {};
@@ -294,42 +340,13 @@ class WholeBodyRL {
     std::array<float, 4> quat = {};
   };
 
-  struct MotorCommand
-  {
-    std::array<float, G1_NUM_MOTOR> q_target = {};
-    std::array<float, G1_NUM_MOTOR> dq_target = {};
-    std::array<float, G1_NUM_MOTOR> kp = {};
-    std::array<float, G1_NUM_MOTOR> kd = {};
-    std::array<float, G1_NUM_MOTOR> tau_ff = {};
-  };
-
-  struct YamlConfig
-  {
-    std::string networkInterface;
-    std::string policy_path;
-    std::string log_dir;
-    std::string log_file;
-    std::array<float, G1_NUM_MOTOR> default_pos = {};
-    std::array<float, G1_NUM_MOTOR> rl_kp = {};
-    std::array<float, G1_NUM_MOTOR> rl_kd = {};
-    std::array<float, G1_NUM_MOTOR> init_kp = {};
-    std::array<float, G1_NUM_MOTOR> init_kd = {};
-    size_t num_obs;
-    size_t num_actions;
-    float ang_vel_scale;
-    float dof_pos_scale;
-    float dof_vel_scale;
-    float action_scale;
-    std::array<float, 3> cmd_scale = {};
-    std::array<float, 3> max_cmd = {};
-  };
+  // YAML config
+  YamlConfig cfg;
 
   // create data buffer
+  g1_sim2real::DataBuffer<MotorCommand> motor_command_buffer_;
   g1_sim2real::DataBuffer<MotorState> motor_state_buffer_;
   g1_sim2real::DataBuffer<ImuState> imu_state_buffer_;
-  g1_sim2real::DataBuffer<MotorCommand> motor_command_buffer_;
-
-  YamlConfig cfg;
 };
 
 #endif  // WHOLEBODY_RL_HPP

@@ -1,88 +1,94 @@
-# Unitree-G1 Sim2Real Depoly Extension Template
+# Unitree-G1 Sim2Real Deploy Extension Template
 > [!note]  
-> This extension template is for `unitree_sdk2`!  
+> Minimal Sim2Real deploy template to run a trained RL policy on the real Unitree G1.  
 > **Author**: [_Sol Choi_](https://github.com/S-CHOI-S)
 
-![alt text](./docs/unitree_g1.png)
+![alt text](https://www.unitree.com/images/52688de58de044358e4792a5b7c1593d_2740x1720.jpg)
 
+## Tested Version
+- OS: *Ubuntu 20.04/22.04*
+- Unitree G1 Model Number: *5, 15*
 
 ## Install
 
-**Step 1.** Install Unitree-SDK2
+**Step 1.** Install *unitree_sdk2*
 
-Checkout the detailed installation guide of [Unitree SDK2](https://github.com/unitreerobotics/unitree_sdk2) in this page
+Checkout the detailed installation guide of *[Unitree SDK2](https://github.com/unitreerobotics/unitree_sdk2)* in this page
+```
+git clone https://github.com/unitreerobotics/unitree_sdk2.git
+cd unitree_sdk2
+mkdir build && cd build
+cmake ..
+make -j
 ```
 
-```
-
-**Step 1.** Clone the repository
+**Step 2.** Clone the *g1_sim2real* repository
 
 ```
 git clone --recursive  https://github.com/S-CHOI-S/Unitree-G1-Sim2Real.git g1_sim2real
+git submodule update --init --recursive
 ```
 
-submodule init
-submodule update
-
-**Step 2.** build onnxruntime
+**Step 3.** Build submodule #1: *onnxruntime*
 
 ```
-./arc_g1.sh  # create conda env
-git checkout v1.11.0
+cd thirdparty/onnxruntime
 ./build.sh --config Release --build_shared_lib --parallel --update --build --build_dir build --enable_pybind --disable_ml_ops
 ```
 
-**Step 3.** build yaml-cpp
+**Step 4.** Build submodule #2: *yaml-cpp*
 ```
+cd thirdparty/yaml-cpp
 cmake .. -DYAML_BUILD_SHARED_LIBS=ON
 ```
 </br>
 
 ## Usage
-### C++ Development
+**Step 1.** Make sure the path: *unitree_sdk2*  
+in `CMakeLists.txt`,
+```
+# ==== PATHS ====
+set(UNITREE_SDK2_DIR ${CMAKE_SOURCE_DIR}/../unitree_sdk2) # change to your path
+```
+- The `UNITREE_SDK2_DIR` value must point to your actual unitree_sdk2 install path.
+
+**Step 2.** Build the project
+
+> Check your robot's [NETWORK_CARD_NAME](https://support.unitree.com/home/en/G1_developer/quick_development#:~:text=subnet%20using%20the-,ifconfig,-command%2C%20as%20shown)!  
+> (for simple check, use `ifconfig` in terminal)
+
 ```
 mkdir build && cd build
-```
-```
 cmake .. && make -j$(nproc)
-```
-```
-./g1_arm_example # run from the build directory
-```
-</br>
 
-### Python Development
-> [!note]  
-> Please make sure that `./setup_libs.sh` has been executed.
+# Run the arm example (7dof arm)
+./g1_arm_example NETWORK_CARD_NAME # run from the build directory
+```
 
+**Step 3.** Run the Sim2Real Controller
+>[!Tip]
+> Change the `config/g1_sim2real.yaml` file for your settings
 ```
-cd py_src
+./wholebody_rl # run from the build directory
 ```
-```
-python check_robot_config.py
-```
-</br>
 
-## Default Settings
-> [!Tip]  
-> Onboard computer: __*unitree@192.168.123.164*__  
-> Python version: **python3.10**  
-> ROS version: **(1) foxy, (2) noetic**  
-> G1 network card name: __*eth0*__
+- Step 1. Press start button to make the robot set the default position!
+- Step 2. Place the robot on the floor! (Robot must be stand up-right)
+- Step 3. Press A to run the RL policy (Sim2Real deploy)
 
-![alt text](./docs/transition_operationg_mode.png)
+> [!Caution]  
+> User should always prepare to press the select button!
+
 
 </br>
 
-## Development Settings
-> If you are an ARC member, please refer to **[this](https://www.notion.so/G1-19f147ce6766809cafd8dc87954b44ec?pvs=4)** page!
+</br>
+
+## License
+- Add the project license here (e.g., MIT, Apache-2.0). If none exists yet, create a LICENSE file to declare it explicitly.
 
 ### References
-https://www.unitree.com/g1/  
-https://www.unitree.com/app/g1/  
-https://support.unitree.com/main  
-https://support.unitree.com/home/en/G1_developer/about_G1  
-https://www.docs.quadruped.de/projects/g1/html/index.html  
+- [unitreerobotics/unitree_sdk2](https://github.com/unitreerobotics/unitree_sdk2)
 
 </br></br>
 

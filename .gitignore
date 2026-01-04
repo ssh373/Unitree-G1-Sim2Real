@@ -1,10 +1,11 @@
 *.egg-info
 **/__pycache__/
-*.swp
-build
+build/
+logs/
+.DS_Store
 .vscode
 *.svg
 *.png
 *.npz
 *.npy
-logs
+*.swp

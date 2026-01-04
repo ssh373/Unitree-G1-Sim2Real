@@ -14,12 +14,13 @@
 
 #* Authors: Sol Choi *#
 
-# network card name
+
+# robot
 network_interface: "eno1" # eth0
 
 # Path to the RL policy
 policy_path: "../policy/sol/0819/policy.onnx"
-log_dir: "wholebody_rl"
+log_dir: "wholebody_rl" # directory to save logs: '../logs/{log_dir}'
 
 # Initial joint angles & RL default joint angles
 default_angles: [ -0.10, 0., 0., 0.3, -0.2, 0.,
@@ -31,12 +32,13 @@ arm_waist_target: [ 0, 0, 0,
 # RL gains
 kps: [100, 100, 100, 150, 40, 40, 100, 100, 100, 150, 40, 40]
 kds: [3, 3, 3, 5, 3, 3, 3, 3, 3, 5, 3, 3]
-arm_waist_kps: [300, 300, 300,
-                100, 100, 50, 50, 20, 20, 20,
-                100, 100, 50, 50, 20, 20, 20]
-arm_waist_kds: [3, 3, 3, 
-                2, 2, 2, 2, 1, 1, 1,
-                2, 2, 2, 2, 1, 1, 1]
+
+arm_waist_kps: [ 300, 300, 300,
+                 100, 100, 50, 50, 20, 20, 20,
+                 100, 100, 50, 50, 20, 20, 20 ]
+arm_waist_kds: [ 3, 3, 3, 
+                 2, 2, 2, 2, 1, 1, 1,
+                 2, 2, 2, 2, 1, 1, 1 ]
 
 # Joint control gains during initialization
 init_leg_kps: [2000, 2000, 2000, 3000, 1000, 1000, 2000, 2000, 2000, 3000, 1000, 1000]
@@ -44,15 +46,15 @@ init_leg_kds: [20, 20, 20, 50, 10, 10, 20, 20, 20, 50, 10, 10]
 
 init_arm_waist_kps: [ 2000, 2000, 2000,
                       60, 60, 60, 60, 60, 60, 60,
-                      60, 60, 60, 60, 60, 60, 60]
+                      60, 60, 60, 60, 60, 60, 60 ]
 
 init_arm_waist_kds: [ 18, 18, 18,
                       10, 10, 10, 10, 10, 10, 10,
-                      10, 10, 10, 10, 10, 10, 10]
+                      10, 10, 10, 10, 10, 10, 10 ]
 
 # RL configuration
-num_obs: 47
-num_actions: 12
+# num_obs: 47
+# num_actions: 12
 ang_vel_scale: 1.0
 dof_pos_scale: 1.0
 dof_vel_scale: 1.0

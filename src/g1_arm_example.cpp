@@ -1,3 +1,7 @@
+/**************************************************************************
+/* Same code as [ g1/high_level/g1_arm7_sdk_dds_example ] in unitree_sdk2 *
+**************************************************************************/
+
 #include <array>
 #include <chrono>
 #include <iostream>
@@ -19,7 +23,7 @@ enum JointIndex {
     kLeftHipRoll,
     kLeftHipYaw,
     kLeftKnee,
-    kLeftAnkle, // ankle pitch
+    kLeftAnkle,
     kLeftAnkleRoll,
 
     // Right leg
@@ -27,7 +31,7 @@ enum JointIndex {
     kRightHipRoll,
     kRightHipYaw,
     kRightKnee,
-    kRightAnkle, // ankle pitch
+    kRightAnkle,
     kRightAnkleRoll,
 
     kWaistYaw,
@@ -39,17 +43,17 @@ enum JointIndex {
     kLeftShoulderRoll,
     kLeftShoulderYaw,
     kLeftElbow,
-    kLeftWistRoll,
-    kLeftWistPitch,
-    kLeftWistYaw,
+    kLeftWristRoll,
+    kLeftWristPitch,
+    kLeftWristYaw,
     // Right arm
     kRightShoulderPitch,
     kRightShoulderRoll,
     kRightShoulderYaw,
     kRightElbow,
-    kRightWistRoll,
-    kRightWistPitch,
-    kRightWistYaw,
+    kRightWristRoll,
+    kRightWristPitch,
+    kRightWristYaw,
 
     kNotUsedJoint,
     kNotUsedJoint1,
@@ -60,7 +64,12 @@ enum JointIndex {
 };
 
 int main(int argc, char const *argv[]) {
-  unitree::robot::ChannelFactory::Instance()->Init(0, "eth0");
+  if (argc < 2) {
+    std::cout << "Usage: " << argv[0] << " networkInterface" << std::endl;
+    exit(-1);
+  }
+
+  unitree::robot::ChannelFactory::Instance()->Init(0, argv[1]);
 
   unitree::robot::ChannelPublisherPtr<unitree_hg::msg::dds_::LowCmd_>
       arm_sdk_publisher;
@@ -87,12 +96,12 @@ int main(int argc, char const *argv[]) {
   std::array<JointIndex, 17> arm_joints = {
       JointIndex::kLeftShoulderPitch,  JointIndex::kLeftShoulderRoll,
       JointIndex::kLeftShoulderYaw,    JointIndex::kLeftElbow,
-      JointIndex::kLeftWistRoll,       JointIndex::kLeftWistPitch,
-      JointIndex::kLeftWistYaw,
+      JointIndex::kLeftWristRoll,       JointIndex::kLeftWristPitch,
+      JointIndex::kLeftWristYaw,
       JointIndex::kRightShoulderPitch, JointIndex::kRightShoulderRoll,
       JointIndex::kRightShoulderYaw,   JointIndex::kRightElbow,
-      JointIndex::kRightWistRoll,      JointIndex::kRightWistPitch,
-      JointIndex::kRightWistYaw,
+      JointIndex::kRightWristRoll,      JointIndex::kRightWristPitch,
+      JointIndex::kRightWristYaw,
       JointIndex::kWaistYaw,
       JointIndex::kWaistRoll,
       JointIndex::kWaistPitch};
@@ -244,6 +253,12 @@ int main(int argc, char const *argv[]) {
     // sleep
     std::this_thread::sleep_for(sleep_time);
   }
+
+
+  // set weight
+  msg.motor_cmd().at(JointIndex::kNotUsedJoint).q(0);
+  // send dds msg
+  arm_sdk_publisher->Write(msg);
 
   std::cout << "Done!" << std::endl;
 
