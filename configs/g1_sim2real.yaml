@@ -16,7 +16,7 @@
 
 
 # robot
-network_interface: "eno1" # eth0
+network_interface: "eth0"
 
 # Path to the RL policy
 policy_path: "../policy/sol/0819/policy.onnx"
