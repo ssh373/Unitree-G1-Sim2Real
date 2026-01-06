@@ -47,6 +47,7 @@
 // onnxruntime
 #include <onnxruntime_cxx_api.h>
 
+// g1_sim2real
 #include "g1_sim2real/gamepad.hpp"
 #include "g1_sim2real/utils.hpp"
 #include "g1_sim2real/loop_freq_monitor.hpp"
@@ -307,8 +308,6 @@ class WholeBodyRL {
     std::array<float, G1_NUM_MOTOR> rl_kd = {};
     std::array<float, G1_NUM_MOTOR> init_kp = {};
     std::array<float, G1_NUM_MOTOR> init_kd = {};
-    // size_t num_obs;
-    // size_t num_actions;
     float ang_vel_scale;
     float dof_pos_scale;
     float dof_vel_scale;

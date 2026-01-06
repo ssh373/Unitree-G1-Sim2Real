@@ -726,20 +726,18 @@ std::vector<float> WholeBodyRL::GetObservation()
     // action
     std::copy(rl_action_.begin(), rl_action_.end(), obs.begin() + start_idx + NUM_ACTIONS); // NUM_ACTIONS
 
-    float cmd_speed = std::sqrt(obs[6] * obs[6] + obs[7] * obs[7]);
-    float stride_length = stride_a + stride_b * cmd_speed;
-    float period = stride_length / (cmd_speed + eps);
+    float period = 0.8f;
     float phase = std::fmod(cnt * control_dt_, period) / period;
 
-    if (cmd_speed > 0.1)
-    {
-      // sin phase
-      obs[45] = std::sin(2.0 * M_PI * phase);
+    // sin phase
+    obs[45] = std::sin(2.0 * M_PI * phase);
 
-      // cos phase
-      obs[46] = std::cos(2.0 * M_PI * phase);
-    }
-    else
+    // cos phase
+    obs[46] = std::cos(2.0 * M_PI * phase);
+
+    float cmd_speed = std::sqrt(obs[6] * obs[6] + obs[7] * obs[7] + obs[8] * obs[8]);
+    
+    if (cmd_speed < 0.1f)
     {
       obs[45] = 0.0f;
       obs[46] = 0.0f;
