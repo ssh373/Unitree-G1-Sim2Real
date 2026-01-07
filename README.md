@@ -75,6 +75,11 @@ cmake .. && make -j$(nproc)
 **Step 3.** Run the Sim2Real Controller
 >[!Note]  
 > Modify `configs/g1_sim2real.yaml` file for your settings
+
+
+>[!Warning]  
+> The current policy exhibits high impact forces. This will be replaced with an improved policy in a future update.
+
 ```
 ./wholebody_rl # run from the build directory
 ```
