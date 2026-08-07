@@ -2,6 +2,12 @@
 **/__pycache__/
 build/
 logs/
+
+# prebuilt tarballs unpacked by CMake on first configure
+thirdparty/.download/
+thirdparty/onnxruntime-*/
+thirdparty/mujoco-*/
+
 .DS_Store
 .vscode
 *.svg

@@ -16,7 +16,7 @@
 
 
 # robot
-network_interface: "eth0"
+network_interface: "lo"
 
 # Path to the RL policy
 policy_path: "../policy/basic_walk/policy.onnx"

@@ -16,117 +16,94 @@
 
 #include "g1_sim2real/wholebody_rl.hpp"
 
-WholeBodyRL::WholeBodyRL(const std::string& policy_path)
-: time_(0.0),
+WholeBodyRL::WholeBodyRL(const std::string& config_yaml_path)
+: mode_pr_(Mode::PR),
+  time_(0.0),
   time_abs(0.0),
   control_dt_(CONTROL_DT), // 500Hz
   command_dt_(COMMAND_DT), // 50Hz
-  duration_(5.0), // move to default pose
-  counter_(0),
-  mode_pr_(Mode::PR),
-  mode_machine_(0)
+  duration_(5.0) // move to default pose
 {
-  LoadYamlConfig(policy_path);
+  LoadYamlConfig(config_yaml_path);
   LoadOnnxModel();
-  InitUnitreeChannel();
-  InitPublisher();
-  InitSubscriber();
-  InitThread();
+
+  logger_thread_ = std::thread(&WholeBodyRL::LoggerThread, this);
 }
 
 WholeBodyRL::~WholeBodyRL()
 {
-  // should_exit_ = true;
+  should_exit_ = true;
   logging_active_ = false;
 
-  if (monitor_thread_.joinable()) monitor_thread_.join();
   if (logger_thread_.joinable()) logger_thread_.join();
 }
 
 
 /*****************************************************************************
-** Initialize functions
+** Comm / sim seam
 *****************************************************************************/
-void WholeBodyRL::InitUnitreeChannel()
+void WholeBodyRL::read(float dt, const MotorState& ms, const ImuState& is)
 {
-  // initialize unitree channel
-  ChannelFactory::Instance()->Init(0, cfg.networkInterface);
+  control_dt_ = dt;
 
-  // motion switcher client
-  msc_ = std::make_shared<unitree::robot::b2::MotionSwitcherClient>();
-  msc_->SetTimeout(5.0f);
-  msc_->Init();
-
-  std::string form, name;
-  while (msc_->CheckMode(form, name), !name.empty())
-  {
-    if (msc_->ReleaseMode()) std::cout << "Failed to switch to Release Mode\n";
-    sleep(5);
-  }
+  motor_state_buffer_.SetData(ms);
+  imu_state_buffer_.SetData(is);
 }
 
-void WholeBodyRL::InitPublisher()
+void WholeBodyRL::set_input(const CommandInput& in)
 {
-  // create publisher
-  lowcmd_publisher_.reset(new ChannelPublisher<LowCmd_>(HG_CMD_TOPIC));
-  lowcmd_publisher_->InitChannel();
+  input_ = in;
 }
 
-void WholeBodyRL::InitSubscriber()
+bool WholeBodyRL::write(MotorCommand& mc)
 {
-  // create subscriber
-  lowstate_subscriber_.reset(new ChannelSubscriber<LowState_>(HG_STATE_TOPIC));
-  lowstate_subscriber_->InitChannel(std::bind(&WholeBodyRL::LowStateHandler, this, std::placeholders::_1), 1);
+  const std::shared_ptr<const MotorCommand> latest = motor_command_buffer_.GetData();
+  if (!latest) return false;
 
-  imutorso_subscriber_.reset(new ChannelSubscriber<IMUState_>(HG_IMU_TORSO));
-  imutorso_subscriber_->InitChannel(std::bind(&WholeBodyRL::imuTorsoHandler, this, std::placeholders::_1), 1);
+  mc = *latest;
+  return true;
+}
+
+void WholeBodyRL::control()
+{
+  // The policy runs at 50Hz, the PD command at 500Hz: the same split the two
+  // recurrent DDS threads used to provide.
+  if (step_cnt % DECIMATION == 0) Control();
+  ++step_cnt;
+
+  CheckSafetyLimits();
+
+  // Phase time base. Must tick at 1/control_dt_ or the gait period drifts.
+  if (state_ == State::RL_POLICY_ACTIVE) cnt++;
+}
+
+void WholeBodyRL::Reset()
+{
+  state_ = State::WAIT_FOR_INIT_COMMAND;
+  mode_pr_ = Mode::PR;
+
+  time_ = 0.0f;
+  time_abs = 0.0f;
+  cnt = 0;
+  step_cnt = 0;
+
+  rl_action_ = {};
+  input_ = CommandInput{};
+
+  logging_active_ = false;
+  should_exit_ = false;
+
+  motor_command_buffer_.Clear();
+  motor_state_buffer_.Clear();
+  imu_state_buffer_.Clear();
+
+  std::cout << "[INFO] Controller reset." << std::endl;
 }
 
 
 /*****************************************************************************
 ** Thread functions
 *****************************************************************************/
-void WholeBodyRL::InitThread()
-{
-  // create threads
-  command_writer_ptr_ = CreateRecurrentThreadEx("command_writer", UT_CPU_ID_NONE, COMMAND_WRITER_PERIOD_US, &WholeBodyRL::LowCommandWriter, this); // 500Hz
-  control_thread_ptr_ = CreateRecurrentThreadEx("control", UT_CPU_ID_NONE, CONTROL_LOOP_PERIOD_US, &WholeBodyRL::Control, this); // 50Hz
-
-  monitor_thread_ = std::thread(&WholeBodyRL::MonitorThread, this);
-  logger_thread_ = std::thread(&WholeBodyRL::LoggerThread, this); 
-}
-
-void WholeBodyRL::MonitorThread() 
-{
-  while (!should_exit_) 
-  {
-    // control freq
-    double control_hz = control_freq_monitor.GetFrequency();
-    
-    // command writer freq
-    double command_writer_hz = command_writer_freq_monitor.GetFrequency();
-
-    if ((1 / command_dt_ - 0.01) <= control_hz && control_hz <= (1 / command_dt_ + 0.01) && !safe_freq_ &&
-        (1 / control_dt_ - 0.01) <= command_writer_hz && command_writer_hz <= (1 / control_dt_ + 0.01))
-    {
-      safe_freq_ = true;
-      std::cout << "\033[32m[Freq Monitor]\033[0m Control freq stable!"
-                << " (Control loop: " << control_hz << " Hz, " << "Command Writer loop: " << command_writer_hz << " Hz)" << std::endl;
-    }
-    else if ((1 / command_dt_ - 0.01) >= control_hz && control_hz >= (1 / command_dt_ + 0.01) &&
-             (1 / control_dt_ - 0.01) >= command_writer_hz && command_writer_hz >= (1 / control_dt_ + 0.01))
-      safe_freq_ = false;
-
-    if (!safe_freq_)
-    {
-      std::lock_guard<std::mutex> lock(cout_mutex);
-      std::cout << "\033[31m[Freq Monitor]\033[0m Control loop: " << control_hz << " Hz, " << "Command Writer loop: " << command_writer_hz << " Hz" << std::endl;
-    }
-    
-    std::this_thread::sleep_for(std::chrono::milliseconds(1000));  // 1s
-  }
-}
-
 void WholeBodyRL::LoggerThread()
 {
   std::ofstream log_file(cfg.log_file);
@@ -289,7 +266,7 @@ void WholeBodyRL::PrintYamlConfig()
 void WholeBodyRL::LoadOnnxModel()
 {
   // initialize onnx runtime env
-  env_ = Ort::Env(ORT_LOGGING_LEVEL_WARNING, "onnx_cpu_RL");
+  env_ = Ort::Env(ORT_LOGGING_LEVEL_WARNING, "wholebody_rl");
 
   // initialize input data
   input_data = std::vector<float>(NUM_OBS, 0.0f);
@@ -304,165 +281,14 @@ void WholeBodyRL::LoadOnnxModel()
   session_ = std::make_unique<Ort::Session>(env_, cfg.policy_path.c_str(), session_options);
 
   // Prepare input/output names
-  const char* input_name = session_->GetInputName(0, allocator_);
-  const char* output_name = session_->GetOutputName(0, allocator_);
+  // The *Allocated variants hand back ownership of the string, so copy it into a
+  // member that outlives input_names/output_names.
+  input_name_holder_ = session_->GetInputNameAllocated(0, allocator_).get();
+  output_name_holder_ = session_->GetOutputNameAllocated(0, allocator_).get();
 
   // input/output names
-  input_names = {input_name};
-  output_names = {output_name};
-}
-
-
-/*****************************************************************************
-** DDS Callback functions
-*****************************************************************************/
-void WholeBodyRL::LowStateHandler(const void *message)
-{
-  LowState_ low_state = *(const LowState_ *)message;
-  if (low_state.crc() != g1_sim2real::Crc32Core((uint32_t *)&low_state, (sizeof(LowState_) >> 2) - 1)) 
-  {
-    std::cout << "[ERROR] CRC Error" << std::endl;
-    return;
-  }
-
-  // get motor state
-  MotorState ms_tmp;
-  for (int i = 0; i < G1_NUM_MOTOR; ++i) 
-  {
-    ms_tmp.q.at(i) = low_state.motor_state()[i].q();
-    ms_tmp.dq.at(i) = low_state.motor_state()[i].dq();
-    ms_tmp.tau.at(i) = low_state.motor_state()[i].tau_est();
-  }
-  motor_state_buffer_.SetData(ms_tmp);
-
-  // get imu state
-  ImuState imu_tmp;
-  imu_tmp.omega = low_state.imu_state().gyroscope();
-  imu_tmp.rpy = low_state.imu_state().rpy();
-  imu_tmp.quat = low_state.imu_state().quaternion();
-  imu_state_buffer_.SetData(imu_tmp);
-
-  // update gamepad
-  memcpy(rx_.buff, &low_state.wireless_remote()[0], 40);
-  gamepad_.update(rx_.RF_RX);
-
-  // update mode machine
-  if (mode_machine_ != low_state.mode_machine()) 
-  {
-    if (mode_machine_ == 0) std::cout << "G1 type: " << unsigned(low_state.mode_machine()) << std::endl;
-    mode_machine_ = low_state.mode_machine();
-  }
-
-  if (static_cast<int>(gamepad_.select.pressed) == 1)
-    should_exit_ = true;
-
-  // report robot status every second
-  if (++counter_ % 500 == 0) 
-  {
-    counter_ = 0;
-
-    // IMU
-    auto &rpy = low_state.imu_state().rpy();
-    // printf("IMU.pelvis.rpy: %.2f %.2f %.2f\n", rpy[0], rpy[1], rpy[2]);
-
-    // RC
-    // printf("gamepad_.A.pressed: %d\n", static_cast<int>(gamepad_.A.pressed));
-    // printf("gamepad_.B.pressed: %d\n", static_cast<int>(gamepad_.B.pressed));
-    // printf("gamepad_.X.pressed: %d\n", static_cast<int>(gamepad_.X.pressed));
-    // printf("gamepad_.Y.pressed: %d\n", static_cast<int>(gamepad_.Y.pressed));
-
-    // printf("gamepad_.go vertical: %f\n", static_cast<float>(gamepad_.ly));
-    // printf("gamepad_.go horizontal: %f\n", static_cast<float>(gamepad_.lx));
-    // printf("gamepad_.turn left: %f\n", static_cast<float>(gamepad_.rx));
-    // printf("gamepad_.turn right: %f\n", static_cast<float>(gamepad_.ry));
-
-    // Motor
-    auto &ms = low_state.motor_state();
-    // printf("All %d Motors:", G1_NUM_MOTOR);
-    // printf("\nmode: ");
-    // for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%u,", ms[i].mode());
-    // printf("\npos: ");
-    // for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%.2f,", ms[i].q());
-    // printf("\nvel: ");
-    // for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%.2f,", ms[i].dq());
-    // printf("\ntau_est: ");
-    // for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%.2f,", ms[i].tau_est());
-    // printf("\ntemperature: ");
-    // for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%d,%d;", ms[i].temperature()[0], ms[i].temperature()[1]);
-    // printf("\nvol: ");
-    // for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%.2f,", ms[i].vol());
-    // printf("\nsensor: ");
-    // for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%u,%u;", ms[i].sensor()[0], ms[i].sensor()[1]);
-    // printf("\nmotorstate: ");
-    // for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%u,", ms[i].motorstate());
-    // printf("\nreserve: ");
-    // for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%u,%u,%u,%u;", ms[i].reserve()[0], ms[i].reserve()[1], ms[i].reserve()[2], ms[i].reserve()[3]);
-    // printf("\n");
-  }
-}
-
-void WholeBodyRL::imuTorsoHandler(const void *message) 
-{
-  IMUState_ imu_torso = *(const IMUState_ *)message;
-  auto &rpy = imu_torso.rpy();
-  // if (counter_ % 500 == 0)
-  //   printf("IMU.torso.rpy: %.2f %.2f %.2f\n", rpy[0], rpy[1], rpy[2]);
-}
-
-
-/*****************************************************************************
-** DDS Command Writer function
-*****************************************************************************/
-void WholeBodyRL::LowCommandWriter()
-{
-  std::array<float, G1_NUM_MOTOR> torque_des;
-
-  command_writer_freq_monitor.Tick();
-
-  LowCmd_ dds_low_command;
-  dds_low_command.mode_pr() = static_cast<uint8_t>(mode_pr_);
-  dds_low_command.mode_machine() = mode_machine_;
-
-  const std::shared_ptr<const MotorCommand> mc = motor_command_buffer_.GetData();
-  const std::shared_ptr<const MotorState> ms = motor_state_buffer_.GetData();
-
-  if (mc && ms)
-  {
-    for (size_t i = 0; i < G1_NUM_MOTOR; i++)
-    {
-      dds_low_command.motor_cmd().at(i).mode() = 1;  // 1:Enable, 0:Disable
-      dds_low_command.motor_cmd().at(i).tau()  = mc->tau_ff.at(i);
-      dds_low_command.motor_cmd().at(i).q()    = mc->q_target.at(i);
-      dds_low_command.motor_cmd().at(i).dq()   = mc->dq_target.at(i);
-      dds_low_command.motor_cmd().at(i).kp()   = mc->kp.at(i);
-      dds_low_command.motor_cmd().at(i).kd()   = mc->kd.at(i);
-    }
-
-    // clamp torque limit
-    for (size_t i = 0; i < NUM_ACTIONS; i++)
-    {
-      torque_des.at(i) = cfg.rl_kp.at(i) * (mc->q_target.at(i) - ms->q.at(i)) + cfg.rl_kd.at(i) * (0 - ms->dq.at(i));
-
-      if (abs(torque_des.at(i)) > torque_limit.at(i))  // torque command
-      {
-        torque_des.at(i) = std::clamp(torque_des.at(i), -torque_limit.at(i), torque_limit.at(i));
-        dds_low_command.motor_cmd().at(i).tau() = torque_des.at(i);
-        dds_low_command.motor_cmd().at(i).q()   = 0;
-        dds_low_command.motor_cmd().at(i).dq()  = 0;
-        dds_low_command.motor_cmd().at(i).kp()  = 0.00001;
-        dds_low_command.motor_cmd().at(i).kd()  = 0.00001;
-      }
-    }
-
-    dds_low_command.crc() = g1_sim2real::Crc32Core((uint32_t *)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
-    lowcmd_publisher_->Write(dds_low_command);
-  }
-
-  CheckSafetyLimits();
-
-  if (should_exit_) std::exit(0);
-
-  if (state_ == State::RL_POLICY_ACTIVE) cnt++;
+  input_names = {input_name_holder_.c_str()};
+  output_names = {output_name_holder_.c_str()};
 }
 
 
@@ -472,8 +298,6 @@ void WholeBodyRL::LowCommandWriter()
 void WholeBodyRL::Control() 
 {
   // monitor control freq monitor
-  control_freq_monitor.Tick();
-  
   MotorCommand motor_command_tmp;
   const std::shared_ptr<const MotorState> ms = motor_state_buffer_.GetData();
 
@@ -495,7 +319,7 @@ void WholeBodyRL::Control()
       case State::WAIT_FOR_INIT_COMMAND:
       {
         // [Stage 0]: set robot to wait for init command
-        if (static_cast<int>(gamepad_.start.pressed) == 1)
+        if (input_.start)
         {
           std::cout << "[INFO] Start button pressed!" << std::endl;
           state_ = State::MOVING_TO_DEFAULT;
@@ -554,7 +378,7 @@ void WholeBodyRL::Control()
         // [Stage 2]: set robot to wait for RL command
         logging_active_ = true;
 
-        if (static_cast<int>(gamepad_.A.pressed) == 1)
+        if (input_.policy)
         {
           time_ = 0.0;
           std::cout << "[INFO] A button pressed!" << std::endl;
@@ -576,9 +400,9 @@ void WholeBodyRL::Control()
       case State::RL_POLICY_ACTIVE:
       {
         // [Stage 3]: run robot with RL policy
-        if (static_cast<int>(gamepad_.select.pressed) == 1)
+        if (input_.damping)
         {
-          std::cout << "[INFO] select button pressed!" << std::endl;
+          std::cout << "[INFO] damping requested!" << std::endl;
           state_ = State::DAMPING_STATE;
         }
 
@@ -704,9 +528,11 @@ std::vector<float> WholeBodyRL::GetObservation()
     obs[5] = gravity_orientation[2];
 
     // command
-    obs[6] = static_cast<float>(gamepad_.ly) * cfg.cmd_scale[0] * cfg.max_cmd[0];
-    obs[7] = static_cast<float>(gamepad_.lx) * -1 * cfg.cmd_scale[1] * cfg.max_cmd[1];
-    obs[8] = static_cast<float>(gamepad_.rx) * -1 * cfg.cmd_scale[2] * cfg.max_cmd[2];
+    // Sign conventions live in the comm layer: it maps its own input device onto
+    // these three velocities (see UnitreeComm::LowStateHandler).
+    obs[6] = input_.lin_vel_x * cfg.cmd_scale[0] * cfg.max_cmd[0];
+    obs[7] = input_.lin_vel_y * cfg.cmd_scale[1] * cfg.max_cmd[1];
+    obs[8] = input_.ang_vel_z * cfg.cmd_scale[2] * cfg.max_cmd[2];
 
     // joint pos
     for (size_t i = 0; i < NUM_ACTIONS; ++i) // NUM_ACTIONS
@@ -758,7 +584,7 @@ std::vector<float> WholeBodyRL::GetObservation()
   return std::vector<float>(NUM_OBS, 0.0f);
 }
 
-std::array<float, WholeBodyRL::NUM_ACTIONS> WholeBodyRL::RunInference()
+std::array<float, NUM_ACTIONS> WholeBodyRL::RunInference()
 {
   // Get observation data
   input_data = GetObservation();
@@ -820,47 +646,5 @@ std::array<float, 3> WholeBodyRL::GetGravityOrientation(const std::array<float, 
   return gravity_orientation;
 }
 
-std::array<float, 3> WholeBodyRL::Quat2RPY(const std::array<float, 4>& q)
-{
-  float qw = q[0];
-  float qx = q[1];
-  float qy = q[2];
-  float qz = q[3];
-
-  std::array<float, 3> rpy;
-
-  rpy[0] = 2.0f * (-qz * qx + qw * qy);
-  rpy[1] = -2.0f * (qz * qy + qw * qx);
-  rpy[2] = 1.0f - 2.0f * (qw * qw + qz * qz);
-
-  float r0 = 2.0f * (qw * qx + qy * qz);
-  float r1 = 1.0f - 2.0f * (qx * qx + qy * qy);
-  rpy[0] = std::atan2(r0, r1);
-
-  float r2 = 2.0f * (qw * qy - qz * qx);
-  r2 = std::clamp(r2, -1.0f, 1.0f);
-  rpy[1] = std::asin(r2);
-
-  float r3 = 2.0f * (qw * qz + qx * qy);
-  float r4 = 1.0f - 2.0f * (qy * qy + qz * qz);
-  rpy[2] = std::atan2(r3, r4);
-
-  return rpy;
-}
 
 
-/*****************************************************************************
-** main function
-*****************************************************************************/
-int main()
-{
-  WholeBodyRL wholebodyrl("../configs/g1_sim2real.yaml");
-
-  while (true)
-  {
-    if (wholebodyrl.should_exit_) break;
-    std::this_thread::sleep_for(std::chrono::microseconds(2000));  // 2ms = 2000μs
-  }
-
-  return 0;
-}
