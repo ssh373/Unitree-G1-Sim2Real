@@ -33,12 +33,30 @@ git clone --recursive  https://github.com/S-CHOI-S/Unitree-G1-Sim2Real.git g1_si
 git submodule update --init --recursive
 ```
 
-**Step 3.** Build submodule #1: `onnxruntime`
+**Step 3.** Get `onnxruntime`
+
+```
+./scripts/get_onnxruntime.sh
+```
+
+Downloads a prebuilt release for this machine's architecture (x86_64 or aarch64) into `thirdparty/`,
+which CMake then picks up on its own.
+
+> [!note]
+> ONNX Runtime **1.14 or newer** is required: policies are exported at opset 18, and the loader
+> uses `GetInputNameAllocated`, which replaced `GetInputName` in 1.14.
+
+<details>
+<summary>Alternative: build the submodule from source (takes about an hour)</summary>
 
 ```
 cd thirdparty/onnxruntime
 ./build.sh --config Release --build_shared_lib --parallel --update --build --build_dir build --enable_pybind --disable_ml_ops
 ```
+
+</details>
+
+To use a copy of ONNX Runtime kept elsewhere, pass `-DONNXRUNTIME_ROOT=<path>` to `cmake` instead.
 
 **Step 4.** Build submodule #2: `yaml-cpp`
 ```

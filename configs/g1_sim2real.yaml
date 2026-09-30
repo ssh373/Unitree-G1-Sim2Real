@@ -16,50 +16,85 @@
 
 
 # robot
-network_interface: "eth0"
+network_interface: "lo" #eth0
+
+# How the FSM is driven and where the velocity command comes from.
+#   "gamepad"  - the robot's wireless remote (Start / A / Select, sticks). Preferred on hardware:
+#                the operator can stand clear of the robot and still stop it.
+#   "xbox"     - an Xbox controller on this PC (xbox_device below). Start stand, A run policy,
+#                Back stop, sticks drive. The wireless remote's Select still works as an
+#                emergency stop.
+#   "keyboard" - this terminal. 1 stand, 2 run policy, w/s/a/d/q/e drive in 0.1 steps,
+#                space stop, x kill. Requires the terminal to stay focused.
+#   "combine"  - keyboard + joystick together: the keyboard holds a base command (cruise, e.g.
+#                pin vx at 2.0 with 'w', space clears it) and the stick adds on top; the sum is
+#                clamped to [cmd_min, cmd_max]. Buttons work from both (1/Start, 2/A, x/Back).
+#                Uses the xbox pad (xbox_device) when connected, the wireless remote otherwise.
+#                keyboard_idle_timeout does not apply: the base is held on purpose.
+input_device: "combine"
+
+# Xbox only: joystick device node (check with `ls /dev/input/js*` and `jstest`).
+xbox_device: "/dev/input/js0"
+
+# Keyboard only: coast the command to zero after this many idle seconds, so a lost terminal focus
+# does not leave the robot running.
+keyboard_idle_timeout: 10.0 # 0이면 꺼짐
 
 # Path to the RL policy
-policy_path: "../policy/basic_walk/policy.onnx"
+policy_path: "../policy/base_height/policy.onnx"
 log_dir: "wholebody_rl" # directory to save logs: '../logs/{log_dir}'
 
 # Initial joint angles & RL default joint angles
 default_angles: [ -0.10, 0., 0., 0.3, -0.2, 0.,
                   -0.10, 0., 0., 0.3, -0.2, 0. ]
 arm_waist_target: [ 0, 0, 0,
-                    0.3, 0.25, 0., 0.97, 0.15, 0., 0.,
-                    0.3, -0.25, 0., 0.97, -0.15, 0., 0. ]
+                    0.3, 0.25, 0., 0., 0.15, 0., 0.,
+                    0.3, -0.25, 0., 0., -0.15, 0., 0. ]
 
 # RL gains
 kps: [ 100, 100, 100, 150, 40, 40,
        100, 100, 100, 150, 40, 40 ]
-kds: [ 3, 3, 3, 5, 3, 3,
-       3, 3, 3, 5, 3, 3 ]
+kds: [ 2, 2, 2, 4, 2, 2,
+       2, 2, 2, 4, 2, 2 ]
 
-arm_waist_kps: [ 300, 300, 300,
-                 100, 100, 50, 50, 20, 20, 20,
-                 100, 100, 50, 50, 20, 20, 20 ]
-arm_waist_kds: [ 3, 3, 3, 
-                 2, 2, 2, 2, 1, 1, 1,
-                 2, 2, 2, 2, 1, 1, 1 ]
+arm_waist_kps: [ 200, 40, 40,
+                 40, 40, 40, 40, 40, 40, 40,
+                 40, 40, 40, 40, 40, 40, 40 ]
+arm_waist_kds: [ 5, 5, 5,
+                 1, 1, 1, 1, 1, 1, 1,
+                 1, 1, 1, 1, 1, 1, 1 ]
 
-# Joint control gains during initialization
-init_leg_kps: [ 2000, 2000, 2000, 3000, 1000, 1000,
-                2000, 2000, 2000, 3000, 1000, 1000 ]
-init_leg_kds: [ 20, 20, 20, 50, 10, 10,
-                20, 20, 20, 50, 10, 10 ]
+# Joint control gains while moving to, and holding, the default pose (before the policy starts).
+# Identical to the RL gains above, which are the trained actuator stiffness/damping
+# (deploy.yaml). Training has no separate standing phase -- those gains are simply always in
+# effect -- so handing the robot to the policy at the very same gains means pressing A changes
+# nothing but the target. Previously 2000/3000 on the legs, a 20x step at handover.
+init_leg_kps: [ 100, 100, 100, 150, 40, 40,
+                100, 100, 100, 150, 40, 40 ]
+init_leg_kds: [ 2, 2, 2, 4, 2, 2,
+                2, 2, 2, 4, 2, 2 ]
 
-init_arm_waist_kps: [ 2000, 2000, 2000,
-                      60, 60, 60, 60, 60, 60, 60,
-                      60, 60, 60, 60, 60, 60, 60 ]
+init_arm_waist_kps: [ 200, 40, 40,
+                      40, 40, 40, 40, 40, 40, 40,
+                      40, 40, 40, 40, 40, 40, 40 ]
 
-init_arm_waist_kds: [ 18, 18, 18,
-                      10, 10, 10, 10, 10, 10, 10,
-                      10, 10, 10, 10, 10, 10, 10 ]
+init_arm_waist_kds: [ 5, 5, 5,
+                      1, 1, 1, 1, 1, 1, 1,
+                      1, 1, 1, 1, 1, 1, 1 ]
 
-# RL configuration
-ang_vel_scale: 0.5
+# RL configuration (unitree_rl_lab g1_29dof running, 2026-09-11_18-14-36 / params/deploy.yaml)
+ang_vel_scale: 0.2
 dof_pos_scale: 1.0
 dof_vel_scale: 0.05
 action_scale: 0.25
 cmd_scale: [1.0, 1.0, 1.0]
-max_cmd: [1.0, 0.5, 0.5]
+
+# gait clock: sin/cos phase obs, masked to 0 while |cmd| < cmd_threshold
+gait_period: 0.5
+cmd_threshold: 0.1
+
+# velocity command (vx, vy, wz): full stick = cmd_max, then clamped to [cmd_min, cmd_max]
+# training range: vx [-1.0, 2.5], vy [-1.0, 1.0], wz [-1.0, 1.0]
+# NOTE: start with a reduced cmd_max (e.g. [1.0, 0.5, 0.5]) for the first hardware runs
+cmd_min: [-1.0, 0.0, -0.4]
+cmd_max: [ 2.0, 0.0,  0.4]

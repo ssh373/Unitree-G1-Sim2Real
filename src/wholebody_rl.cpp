@@ -16,6 +16,8 @@
 
 #include "g1_sim2real/wholebody_rl.hpp"
 
+#include <sstream>
+
 WholeBodyRL::WholeBodyRL(const std::string& policy_path)
 : time_(0.0),
   time_abs(0.0),
@@ -26,7 +28,29 @@ WholeBodyRL::WholeBodyRL(const std::string& policy_path)
   mode_pr_(Mode::PR),
   mode_machine_(0)
 {
+  LoadSimOverrides();
   LoadYamlConfig(policy_path);
+  if (cfg.input_device == "keyboard")
+  {
+    keyboard_ = std::make_unique<g1_sim2real::Keyboard>();
+    std::cout << "\033[33m[INPUT] Keyboard control: keep this terminal focused. The wireless remote\n"
+              << "        is the safer stop whenever one is available.\033[0m" << std::endl;
+  }
+  else if (cfg.input_device == "xbox")
+  {
+    xbox_ = std::make_unique<g1_sim2real::XboxGamepad>(cfg.xbox_device);
+    std::cout << "\033[33m[INPUT] Xbox controller (" << cfg.xbox_device << "): Start stand, A run policy,\n"
+              << "        Back stop. The wireless remote's Select still works as an emergency stop.\033[0m" << std::endl;
+  }
+  else if (cfg.input_device == "combine")
+  {
+    combine_ = true;
+    keyboard_ = std::make_unique<g1_sim2real::Keyboard>();
+    xbox_ = std::make_unique<g1_sim2real::XboxGamepad>(cfg.xbox_device);
+    std::cout << "\033[33m[INPUT] Combine: keyboard holds a base command (w/s/a/d/q/e, space clears),\n"
+              << "        the joystick adds on top. Buttons work from both (1/Start, 2/A, x/Back).\n"
+              << "        Without an xbox pad the wireless remote's sticks are used instead.\033[0m" << std::endl;
+  }
   LoadOnnxModel();
   InitUnitreeChannel();
   InitPublisher();
@@ -143,6 +167,14 @@ void WholeBodyRL::LoggerThread()
   for (int i = 0; i < G1_NUM_MOTOR; ++i) log_file << ",qdot" << i;
   for (int i = 0; i < G1_NUM_MOTOR; ++i) log_file << ",tau" << i;
   for (int i = 0; i < G1_NUM_MOTOR; ++i) log_file << ",taudes" << i;
+  // context for the joint traces above: what was asked of the robot, how it was oriented, and
+  // which of the safety mechanisms were engaged
+  log_file << ",cmd_x,cmd_y,cmd_w"          // velocity command fed to the policy
+           << ",phase_sin,phase_cos"        // gait clock; (0,0) means the policy is in standing mode
+           << ",roll,pitch,yaw"             // pelvis IMU orientation
+           << ",gyro_x,gyro_y,gyro_z"       // pelvis IMU angular rate
+           << ",fsm_state"                  // 0 wait_init, 1 moving, 2 wait_policy, 3 rl_active, 4 damping
+           << ",clamp_mask";                // bit i set if motor i hit the torque clamp since the last row
   log_file << "\n";
   log_file.flush();
 
@@ -158,7 +190,16 @@ void WholeBodyRL::LoggerThread()
       for (int i = 0; i < G1_NUM_MOTOR; ++i) log_file << "," << mc->q_target.at(i);
       for (int i = 0; i < G1_NUM_MOTOR; ++i) log_file << "," << ms->dq.at(i);
       for (int i = 0; i < G1_NUM_MOTOR; ++i) log_file << "," << ms->tau.at(i);
-      for (int i = 0; i < G1_NUM_MOTOR; ++i) log_file << "," << cfg.rl_kp.at(i) * (mc->q_target.at(i) - ms->q.at(i)) + cfg.rl_kd.at(i) * (0 - ms->dq.at(i));
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) log_file << "," << mc->kp.at(i) * (mc->q_target.at(i) - ms->q.at(i)) + mc->kd.at(i) * (mc->dq_target.at(i) - ms->dq.at(i));
+
+      const auto is = imu_state_buffer_.GetData();
+      log_file << "," << last_cmd_[0] << "," << last_cmd_[1] << "," << last_cmd_[2]
+               << "," << last_phase_[0] << "," << last_phase_[1];
+      if (is) log_file << "," << is->rpy[0]   << "," << is->rpy[1]   << "," << is->rpy[2]
+                       << "," << is->omega[0] << "," << is->omega[1] << "," << is->omega[2];
+      else    log_file << ",,,,,,";
+      log_file << "," << static_cast<int>(state_)
+               << "," << clamp_mask_.exchange(0, std::memory_order_relaxed);
       log_file << "\n";
       log_file.flush();
     }
@@ -174,6 +215,40 @@ void WholeBodyRL::LoggerThread()
 /*****************************************************************************
 ** Config & Model loading functions
 *****************************************************************************/
+void WholeBodyRL::LoadSimOverrides()
+{
+  // Opt-in simulation helpers; absent env vars leave every hardware behaviour untouched.
+  if (const char* v = std::getenv("SIM_AUTO_START"))
+  {
+    const std::string val(v);
+    sim_auto_start_ = (val != "0");
+    if (sim_auto_start_)
+    {
+      try { if (!val.empty() && val != "1") sim_auto_start_delay_ = std::stof(val); } catch (...) {}
+      std::cout << "\033[33m[SIM] SIM_AUTO_START: Start in " << sim_auto_start_delay_
+                << " s, A once the default pose is held. DO NOT set this on hardware.\033[0m" << std::endl;
+    }
+  }
+
+  if (const char* v = std::getenv("SIM_CMD"))
+  {
+    std::stringstream ss(v);
+    std::string tok;
+    size_t i = 0;
+    while (i < sim_cmd_.size() && std::getline(ss, tok, ',')) 
+    {
+      try { sim_cmd_[i++] = std::stof(tok); } catch (...) { break; }
+    }
+    sim_cmd_active_ = (i == sim_cmd_.size());
+    if (sim_cmd_active_)
+      std::cout << "\033[33m[SIM] SIM_CMD: velocity command fixed at [" << sim_cmd_[0] << ", "
+                << sim_cmd_[1] << ", " << sim_cmd_[2] << "], eased in over " << SIM_CMD_RAMP_S
+                << " s. DO NOT set this on hardware.\033[0m" << std::endl;
+    else
+      std::cerr << "[SIM] SIM_CMD must be \"vx,vy,wz\" -- ignored" << std::endl;
+  }
+}
+
 void WholeBodyRL::LoadYamlConfig(const std::string& config_yaml_path)
 {
   try
@@ -254,10 +329,31 @@ void WholeBodyRL::LoadYamlConfig(const std::string& config_yaml_path)
     cfg.dof_pos_scale = config["dof_pos_scale"].as<float>();
     cfg.dof_vel_scale = config["dof_vel_scale"].as<float>();
     cfg.action_scale = config["action_scale"].as<float>();
-    std::vector<float> cmd_scale = config["cmd_scale"].as<std::vector<float>>();
-    std::copy(cmd_scale.begin(), cmd_scale.end(), cfg.cmd_scale.begin());
-    std::vector<float> max_cmd = config["max_cmd"].as<std::vector<float>>();
-    std::copy(max_cmd.begin(), max_cmd.end(), cfg.max_cmd.begin());
+    cfg.input_device = config["input_device"] ? config["input_device"].as<std::string>() : "gamepad";
+    if (cfg.input_device != "gamepad" && cfg.input_device != "keyboard" && cfg.input_device != "xbox"
+        && cfg.input_device != "combine")
+      throw std::runtime_error("input_device must be \"gamepad\", \"keyboard\", \"xbox\" or \"combine\"");
+    cfg.xbox_device = config["xbox_device"] ? config["xbox_device"].as<std::string>() : "/dev/input/js0";
+    cfg.keyboard_idle_timeout = config["keyboard_idle_timeout"] ? config["keyboard_idle_timeout"].as<float>() : 0.0f;
+
+    cfg.gait_period = config["gait_period"].as<float>();
+    cfg.cmd_threshold = config["cmd_threshold"].as<float>();
+    if (cfg.gait_period <= 0.f)
+      throw std::runtime_error("YAML gait_period must be > 0");
+
+    auto load_vec3 = [&](const char* key, std::array<float, 3>& dst)
+    {
+      std::vector<float> v = config[key].as<std::vector<float>>();
+      if (v.size() != 3)
+        throw std::runtime_error(std::string("YAML ") + key + " must have 3 elements");
+      std::copy(v.begin(), v.end(), dst.begin());
+    };
+    load_vec3("cmd_scale", cfg.cmd_scale);
+    load_vec3("cmd_min", cfg.cmd_min);
+    load_vec3("cmd_max", cfg.cmd_max);
+    for (int i = 0; i < 3; ++i)
+      if (cfg.cmd_min[i] > cfg.cmd_max[i])
+        throw std::runtime_error("YAML cmd_min must be <= cmd_max");
     
     PrintYamlConfig();
   }
@@ -278,10 +374,25 @@ void WholeBodyRL::PrintYamlConfig()
   std::cout << "    dof_vel_scale  : " << cfg.dof_vel_scale << "\n";
   std::cout << "    action_scale   : " << cfg.action_scale << "\n";
   std::cout << "    cmd_scale      : [" << cfg.cmd_scale[0] << ", " << cfg.cmd_scale[1] << ", " << cfg.cmd_scale[2] << "]\n";
-  std::cout << "    max_cmd        : [" << cfg.max_cmd[0] << ", " << cfg.max_cmd[1] << ", " << cfg.max_cmd[2] << "]\n";
+  std::cout << "    cmd_min        : [" << cfg.cmd_min[0] << ", " << cfg.cmd_min[1] << ", " << cfg.cmd_min[2] << "]\n";
+  std::cout << "    cmd_max        : [" << cfg.cmd_max[0] << ", " << cfg.cmd_max[1] << ", " << cfg.cmd_max[2] << "]\n";
+  std::cout << "  Input device     : " << cfg.input_device;
+  if (cfg.input_device == "keyboard")
+    std::cout << "  (1 stand, 2 run policy, wasdqe drive, space stop, x kill"
+              << (cfg.keyboard_idle_timeout > 0.f ? ", auto-stop after " + std::to_string(cfg.keyboard_idle_timeout) + "s idle)" : ")");
+  else if (cfg.input_device == "xbox")
+    std::cout << "  (" << cfg.xbox_device << ": Start stand, A run policy, Back stop, sticks drive)";
+  else if (cfg.input_device == "combine")
+    std::cout << "  (keyboard base command + joystick on top; buttons from both)";
+  std::cout << "\n";
+  std::cout << "  Gait clock:\n";
+  std::cout << "    gait_period    : " << cfg.gait_period << "\n";
+  std::cout << "    cmd_threshold  : " << cfg.cmd_threshold << "\n";
 
   std::cout << "  Model dimensions:\n";
-  std::cout << "    num_obs        : " << NUM_OBS<< "\n";
+  std::cout << "    num_single_obs : " << NUM_SINGLE_OBS << "\n";
+  std::cout << "    history_len    : " << OBS_HISTORY_LEN << "\n";
+  std::cout << "    num_obs        : " << NUM_OBS << "\n";
   std::cout << "    num_actions    : " << NUM_ACTIONS << "\n";
   std::cout << "================================================================================\n" << std::endl;
 }
@@ -303,13 +414,26 @@ void WholeBodyRL::LoadOnnxModel()
   // load onnx model
   session_ = std::make_unique<Ort::Session>(env_, cfg.policy_path.c_str(), session_options);
 
-  // Prepare input/output names
-  const char* input_name = session_->GetInputName(0, allocator_);
-  const char* output_name = session_->GetOutputName(0, allocator_);
+  // Prepare input/output names (ORT >= 1.14: allocated strings must outlive the session run)
+  io_name_holders_.push_back(session_->GetInputNameAllocated(0, allocator_));
+  io_name_holders_.push_back(session_->GetOutputNameAllocated(0, allocator_));
+  input_names = {io_name_holders_[0].get()};
+  output_names = {io_name_holders_[1].get()};
 
-  // input/output names
-  input_names = {input_name};
-  output_names = {output_name};
+  // Verify the model matches the compiled observation/action layout before touching the robot
+  const auto in_shape = session_->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape();
+  const auto out_shape = session_->GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape();
+  auto last_dim = [](const std::vector<int64_t>& shape) { return shape.empty() ? int64_t(-1) : shape.back(); };
+
+  std::cout << "[ONNX] input '" << input_names[0] << "' dim=" << last_dim(in_shape)
+            << ", output '" << output_names[0] << "' dim=" << last_dim(out_shape) << std::endl;
+
+  if (session_->GetInputCount() != 1 || session_->GetOutputCount() != 1)
+    throw std::runtime_error("ONNX model must have exactly 1 input and 1 output (no recurrent state supported)");
+  if (last_dim(in_shape) != static_cast<int64_t>(NUM_OBS))
+    throw std::runtime_error("ONNX input dim " + std::to_string(last_dim(in_shape)) + " != NUM_OBS " + std::to_string(NUM_OBS));
+  if (last_dim(out_shape) != static_cast<int64_t>(NUM_ACTIONS))
+    throw std::runtime_error("ONNX output dim " + std::to_string(last_dim(out_shape)) + " != NUM_ACTIONS " + std::to_string(NUM_ACTIONS));
 }
 
 
@@ -342,9 +466,20 @@ void WholeBodyRL::LowStateHandler(const void *message)
   imu_tmp.quat = low_state.imu_state().quaternion();
   imu_state_buffer_.SetData(imu_tmp);
 
-  // update gamepad
+  // update gamepad: from the xbox controller when selected, otherwise from the wireless remote.
+  // The remote's Select stays live as an emergency stop either way.
   memcpy(rx_.buff, &low_state.wireless_remote()[0], 40);
-  gamepad_.update(rx_.RF_RX);
+  if (xbox_ && xbox_->connected())
+  {
+    auto xbox_data = xbox_->data();
+    gamepad_.update(xbox_data);
+    if (rx_.RF_RX.btn.components.select) should_exit_ = true;
+  }
+  else
+  {
+    // wireless remote; also the fallback while an xbox pad is selected but unplugged
+    gamepad_.update(rx_.RF_RX);
+  }
 
   // update mode machine
   if (mode_machine_ != low_state.mode_machine()) 
@@ -438,14 +573,18 @@ void WholeBodyRL::LowCommandWriter()
       dds_low_command.motor_cmd().at(i).kd()   = mc->kd.at(i);
     }
 
-    // clamp torque limit
+    // clamp torque a few Nm below the kill threshold, so a saturating command never trips
+    // CheckSafetyLimits by itself (see TORQUE_CLAMP_RATIO)
     for (size_t i = 0; i < NUM_ACTIONS; i++)
     {
-      torque_des.at(i) = cfg.rl_kp.at(i) * (mc->q_target.at(i) - ms->q.at(i)) + cfg.rl_kd.at(i) * (0 - ms->dq.at(i));
+      const float clamp_limit = torque_limit.at(i) * TORQUE_CLAMP_RATIO;
 
-      if (abs(torque_des.at(i)) > torque_limit.at(i))  // torque command
+      torque_des.at(i) = mc->kp.at(i) * (mc->q_target.at(i) - ms->q.at(i)) + mc->kd.at(i) * (mc->dq_target.at(i) - ms->dq.at(i));
+
+      if (abs(torque_des.at(i)) > clamp_limit)  // torque command
       {
-        torque_des.at(i) = std::clamp(torque_des.at(i), -torque_limit.at(i), torque_limit.at(i));
+        clamp_mask_.fetch_or(1u << i, std::memory_order_relaxed);
+        torque_des.at(i) = std::clamp(torque_des.at(i), -clamp_limit, clamp_limit);
         dds_low_command.motor_cmd().at(i).tau() = torque_des.at(i);
         dds_low_command.motor_cmd().at(i).q()   = 0;
         dds_low_command.motor_cmd().at(i).dq()  = 0;
@@ -490,13 +629,25 @@ void WholeBodyRL::Control()
   {
     time_abs += command_dt_;
 
+    if (keyboard_) UpdateKeyboardInput();
+    if (!keyboard_ || combine_) EchoJoystickCommand();
+
     switch (state_) 
     {
       case State::WAIT_FOR_INIT_COMMAND:
       {
         // [Stage 0]: set robot to wait for init command
-        if (static_cast<int>(gamepad_.start.pressed) == 1)
+        bool start_requested = (static_cast<int>(gamepad_.start.pressed) == 1);
+        if (kb_start_) { kb_start_ = false; start_requested = true; }
+        if (sim_auto_start_)
         {
+          sim_state_time_ += command_dt_;
+          if (sim_state_time_ >= sim_auto_start_delay_) start_requested = true;
+        }
+
+        if (start_requested)
+        {
+          sim_state_time_ = 0.0f;
           std::cout << "[INFO] Start button pressed!" << std::endl;
           state_ = State::MOVING_TO_DEFAULT;
           printf("G1 is in [MOVING_TO_DEFAULT] mode!\n");
@@ -554,9 +705,19 @@ void WholeBodyRL::Control()
         // [Stage 2]: set robot to wait for RL command
         logging_active_ = true;
 
-        if (static_cast<int>(gamepad_.A.pressed) == 1)
+        bool policy_requested = (static_cast<int>(gamepad_.A.pressed) == 1);
+        if (kb_policy_) { kb_policy_ = false; policy_requested = true; }
+        if (sim_auto_start_)
         {
+          sim_state_time_ += command_dt_;
+          if (sim_state_time_ >= 2.0f) policy_requested = true;  // settle in the default pose first
+        }
+
+        if (policy_requested)
+        {
+          sim_state_time_ = 0.0f;
           time_ = 0.0;
+          ResetPolicyState();
           std::cout << "[INFO] A button pressed!" << std::endl;
           state_ = State::RL_POLICY_ACTIVE;
         }
@@ -586,20 +747,13 @@ void WholeBodyRL::Control()
 
         mode_pr_ = Mode::PR;
 
+        // whole-body: policy output (policy joint order) -> SDK motor via joint_ids_map
         for (size_t i = 0; i < NUM_ACTIONS; ++i)
         {
-          int i2m_idx = isaaclab2mujoco[i];
-          motor_command_tmp.q_target[i] = (rl_action_.at(i2m_idx) * cfg.action_scale) + cfg.default_pos[i];
-          motor_command_tmp.kp.at(i) = cfg.rl_kp[i];
-          motor_command_tmp.kd.at(i) = cfg.rl_kd[i];
-        }
-
-        // upper: keep default pose
-        for (size_t i = NUM_ACTIONS; i < G1_NUM_MOTOR; ++i)
-        {
-          motor_command_tmp.q_target[i] = cfg.default_pos[i];
-          motor_command_tmp.kp.at(i) = cfg.init_kp[i];
-          motor_command_tmp.kd.at(i) = cfg.init_kd[i];
+          const int m = joint_ids_map[i];
+          motor_command_tmp.q_target.at(m) = (rl_action_.at(i) * cfg.action_scale) + cfg.default_pos[m];
+          motor_command_tmp.kp.at(m) = cfg.rl_kp[m];
+          motor_command_tmp.kd.at(m) = cfg.rl_kd[m];
         }
 
         CheckSafetyLimits();
@@ -643,8 +797,8 @@ void WholeBodyRL::CheckSafetyLimits()
   {
     for (int i = 0; i < G1_NUM_MOTOR; ++i)
     {
-      if (ms->q.at(i) < joint_pos_min.at(i) // check joint position limit (min)
-          || ms->q.at(i) > joint_pos_max.at(i) // check joint position limit (max)
+      if (ms->q.at(i) < joint_pos_min.at(i) - JOINT_POS_MARGIN // check joint position limit (min)
+          || ms->q.at(i) > joint_pos_max.at(i) + JOINT_POS_MARGIN // check joint position limit (max)
           || abs(ms->tau.at(i)) > torque_limit.at(i)) // check joint torque limit
       {
         std::cout<< "\033[31m[ERROR] Motor state limitation Occur! \033[0m\n";
@@ -682,80 +836,201 @@ void WholeBodyRL::CheckSafetyLimits()
 /*****************************************************************************
 ** RL functions
 *****************************************************************************/
+void WholeBodyRL::UpdateKeyboardInput()
+{
+  const std::string key = keyboard_->key();
+  const bool pressed = !key.empty() && key != kb_last_key_;  // edge, so a held key does not run away
+  kb_last_key_ = key;
+
+  kb_idle_ = pressed ? 0.0f : kb_idle_ + command_dt_;
+
+  if (pressed)
+  {
+    if      (key == "1") kb_start_ = true;
+    else if (key == "2") kb_policy_ = true;
+    else if (key == "x") { state_ = State::DAMPING_STATE; }
+    else if (key == " ") kb_cmd_ = {};
+    else if (key == "w") kb_cmd_[0] += KB_CMD_STEP;
+    else if (key == "s") kb_cmd_[0] -= KB_CMD_STEP;
+    else if (key == "a") kb_cmd_[1] += KB_CMD_STEP;
+    else if (key == "d") kb_cmd_[1] -= KB_CMD_STEP;
+    else if (key == "q") kb_cmd_[2] += KB_CMD_STEP;
+    else if (key == "e") kb_cmd_[2] -= KB_CMD_STEP;
+
+    for (int i = 0; i < 3; ++i) kb_cmd_[i] = std::clamp(kb_cmd_[i], cfg.cmd_min[i], cfg.cmd_max[i]);
+
+    if (state_ == State::RL_POLICY_ACTIVE && key != "1" && key != "2")
+      printf("[INPUT] cmd: vx %.2f  vy %.2f  wz %.2f\n", kb_cmd_[0], kb_cmd_[1], kb_cmd_[2]);
+  }
+
+  // Coast to a stop if the operator stops typing: a lost terminal focus should not leave the robot
+  // running at speed. Set keyboard_idle_timeout to 0 in the config to switch this off.
+  // Not in combine mode: there the keyboard command is a held cruise setting by design, and the
+  // joystick in the operator's hand is the live stop.
+  if (!combine_ && cfg.keyboard_idle_timeout > 0.0f && kb_idle_ > cfg.keyboard_idle_timeout)
+  {
+    bool moving = false;
+    for (int i = 0; i < 3; ++i)
+    {
+      const float step = cfg.cmd_max[i] * command_dt_ / KB_DECAY_S;
+      if (std::abs(kb_cmd_[i]) <= step) kb_cmd_[i] = 0.0f;
+      else { kb_cmd_[i] -= std::copysign(step, kb_cmd_[i]); moving = true; }
+    }
+    if (moving && static_cast<int>(kb_idle_ / command_dt_) % 25 == 0)
+      printf("[INPUT] idle %.1fs -- coasting to a stop\n", kb_idle_);
+  }
+}
+
+void WholeBodyRL::EchoJoystickCommand()
+{
+  // Echo the stick command (wireless remote / xbox) so the operator can verify the joystick
+  // works and see what the policy is being told: 1 Hz while deflected, one zero line on release.
+  // In combine mode this is the merged command (keyboard base + stick).
+  std::array<float, 3> cmd = {};
+  const std::array<float, 3> stick = { static_cast<float>(gamepad_.ly),
+                                       static_cast<float>(-gamepad_.lx),
+                                       static_cast<float>(-gamepad_.rx) };
+  bool moving = false;
+  for (int i = 0; i < 3; ++i)
+  {
+    const float base = combine_ ? kb_cmd_[i] : 0.0f;
+    cmd[i] = std::clamp(base + stick[i] * cfg.cmd_max[i], cfg.cmd_min[i], cfg.cmd_max[i]);
+    moving |= std::abs(cmd[i]) > 0.02f;
+  }
+
+  ++js_echo_cnt_;
+  if ((moving && js_echo_cnt_ % 50 == 0) || (!moving && js_echo_moving_))
+    printf("[INPUT] cmd: vx %.2f  vy %.2f  wz %.2f\n", cmd[0], cmd[1], cmd[2]);
+  js_echo_moving_ = moving;
+}
+
+void WholeBodyRL::ResetPolicyState()
+{
+  // mirrors env.reset() in deployment: gait clock restarts, last_action = 0, history refilled on first step
+  cnt = 0;
+  rl_action_.fill(0.0f);
+  obs_history_initialized_ = false;
+}
+
+std::array<float, WholeBodyRL::NUM_SINGLE_OBS> WholeBodyRL::GetSingleObservation()
+{
+  // one frame in training term order:
+  //   base_ang_vel(3) | projected_gravity(3) | velocity_commands(3) | joint_pos_rel(29) | joint_vel_rel(29) | last_action(29) | gait_phase(2)
+  // caller guarantees motor/imu buffers are valid
+  const std::shared_ptr<const MotorState> ms = motor_state_buffer_.GetData();
+  const std::shared_ptr<const ImuState> is = imu_state_buffer_.GetData();
+
+  std::array<float, NUM_SINGLE_OBS> obs = {};
+  size_t idx = 0;
+
+  // base_ang_vel
+  for (int i = 0; i < 3; ++i)
+    obs[idx++] = is->omega[i] * cfg.ang_vel_scale;
+
+  // projected_gravity
+  const std::array<float, 3> gravity_orientation = GetGravityOrientation(is->quat);
+  for (int i = 0; i < 3; ++i)
+    obs[idx++] = gravity_orientation[i];
+
+  // velocity_commands: full stick = cmd_max, then clamp to the (asymmetric) training range
+  const std::array<float, 3> stick = { static_cast<float>(gamepad_.ly),
+                                       static_cast<float>(-gamepad_.lx),
+                                       static_cast<float>(-gamepad_.rx) };
+  // SIM_CMD is already in m/s and rad/s, so it bypasses the stick scaling but keeps the clamp
+  const float sim_ramp = std::clamp(cnt * control_dt_ / SIM_CMD_RAMP_S, 0.0f, 1.0f);
+  std::array<float, 3> cmd = {};
+  for (int i = 0; i < 3; ++i)
+  {
+    // combine: keyboard holds a base command (cruise), the stick adds on top of it
+    const float stick_cmd = stick[i] * cfg.cmd_max[i];
+    const float raw = sim_cmd_active_ ? sim_cmd_[i] * sim_ramp
+                    : combine_         ? kb_cmd_[i] + stick_cmd
+                    : keyboard_        ? kb_cmd_[i]
+                                       : stick_cmd;
+    cmd[i] = std::clamp(raw, cfg.cmd_min[i], cfg.cmd_max[i]);
+    obs[idx++] = cmd[i] * cfg.cmd_scale[i];
+  }
+  last_cmd_ = cmd;
+
+  // joint_pos_rel (policy order)
+  for (size_t i = 0; i < NUM_ACTIONS; ++i)
+  {
+    const int m = joint_ids_map[i];
+    obs[idx++] = (ms->q[m] - cfg.default_pos[m]) * cfg.dof_pos_scale;
+  }
+
+  // joint_vel_rel (policy order)
+  for (size_t i = 0; i < NUM_ACTIONS; ++i)
+    obs[idx++] = ms->dq[joint_ids_map[i]] * cfg.dof_vel_scale;
+
+  // last_action (raw policy output)
+  for (size_t i = 0; i < NUM_ACTIONS; ++i)
+    obs[idx++] = rl_action_[i];
+
+  // gait_phase: clock runs on time since activation, masked to (0,0) while standing
+  const float phase = std::fmod(cnt * control_dt_, cfg.gait_period) / cfg.gait_period;
+  const float cmd_norm = std::sqrt(cmd[0] * cmd[0] + cmd[1] * cmd[1] + cmd[2] * cmd[2]);
+  if (cmd_norm < cfg.cmd_threshold)
+  {
+    obs[idx++] = 0.0f;
+    obs[idx++] = 0.0f;
+  }
+  else
+  {
+    obs[idx++] = std::sin(2.0f * static_cast<float>(M_PI) * phase);
+    obs[idx++] = std::cos(2.0f * static_cast<float>(M_PI) * phase);
+  }
+  last_phase_ = { obs[idx - 2], obs[idx - 1] };
+
+  return obs;
+}
+
 std::vector<float> WholeBodyRL::GetObservation()
 {
   const std::shared_ptr<const MotorState> ms = motor_state_buffer_.GetData();
   const std::shared_ptr<const ImuState> is = imu_state_buffer_.GetData();
-  
-  if (ms && is)
-  {
-    std::vector<float> obs(NUM_OBS);
-    std::array<float, 3> gravity_orientation = GetGravityOrientation(is->quat);
 
-    // ang_vel
-    for (int i = 0; i < 3; ++i)
-    {
-      obs[i] = is->omega[i] * cfg.ang_vel_scale;
-    }
-    
-    // projected gravity
-    obs[3] = gravity_orientation[0];
-    obs[4] = gravity_orientation[1];
-    obs[5] = gravity_orientation[2];
-
-    // command
-    obs[6] = static_cast<float>(gamepad_.ly) * cfg.cmd_scale[0] * cfg.max_cmd[0];
-    obs[7] = static_cast<float>(gamepad_.lx) * -1 * cfg.cmd_scale[1] * cfg.max_cmd[1];
-    obs[8] = static_cast<float>(gamepad_.rx) * -1 * cfg.cmd_scale[2] * cfg.max_cmd[2];
-
-    // joint pos
-    for (size_t i = 0; i < NUM_ACTIONS; ++i) // NUM_ACTIONS
-    {
-      int m2i_idx = mujoco2isaaclab[i];
-      obs[start_idx + i] = (ms->q[m2i_idx] - cfg.default_pos[m2i_idx]) * cfg.dof_pos_scale;
-    }
-
-    // joint vel
-    start_idx += NUM_ACTIONS;
-    for (size_t i = 0; i < NUM_ACTIONS; ++i) // NUM_ACTIONS
-    {
-      int m2i_idx = mujoco2isaaclab[i];
-      obs[start_idx + i] = ms->dq[m2i_idx] * cfg.dof_vel_scale;
-    }
-
-    // action
-    std::copy(rl_action_.begin(), rl_action_.end(), obs.begin() + start_idx + NUM_ACTIONS); // NUM_ACTIONS
-
-    float period = 0.8f;
-    float phase = std::fmod(cnt * control_dt_, period) / period;
-
-    // sin phase
-    obs[45] = std::sin(2.0 * M_PI * phase);
-
-    // cos phase
-    obs[46] = std::cos(2.0 * M_PI * phase);
-
-    float cmd_speed = std::sqrt(obs[6] * obs[6] + obs[7] * obs[7] + obs[8] * obs[8]);
-    
-    if (cmd_speed < 0.1f)
-    {
-      obs[45] = 0.0f;
-      obs[46] = 0.0f;
-    }
-
-    start_idx = 9;
-
-    return obs;
-  }
-
-  if (!ms || !is) 
+  if (!ms || !is)
   {
     std::cerr << "[ERROR] Failed to make Observation! Change to Damping mode!" << std::endl;
     state_ = State::DAMPING_STATE;
-    should_exit_=true;
+    should_exit_ = true;
+    return std::vector<float>(NUM_OBS, 0.0f);
   }
 
-  return std::vector<float>(NUM_OBS, 0.0f);
+  const std::array<float, NUM_SINGLE_OBS> frame = GetSingleObservation();
+
+  // history buffer: oldest -> newest; on (re)activation fill every slot with the first frame (IsaacLab CircularBuffer reset)
+  if (!obs_history_initialized_)
+  {
+    obs_history_.fill(frame);
+    obs_history_initialized_ = true;
+  }
+  else
+  {
+    std::rotate(obs_history_.begin(), obs_history_.begin() + 1, obs_history_.end());
+    obs_history_.back() = frame;
+  }
+
+  // flatten term-major, oldest -> newest inside each term (IsaacLab flatten_history_dim layout):
+  //   [ang_vel x5][gravity x5][cmd x5][joint_pos x5][joint_vel x5][last_action x5][phase x5]
+  static constexpr std::array<std::pair<size_t, size_t>, 7> terms = {{
+    {0, 3},
+    {3, 3},
+    {6, 3},
+    {9, NUM_ACTIONS},
+    {9 + NUM_ACTIONS, NUM_ACTIONS},
+    {9 + 2 * NUM_ACTIONS, NUM_ACTIONS},
+    {9 + 3 * NUM_ACTIONS, 2}
+  }};
+
+  std::vector<float> obs;
+  obs.reserve(NUM_OBS);
+  for (const auto& [offset, len] : terms)
+    for (size_t h = 0; h < OBS_HISTORY_LEN; ++h)
+      obs.insert(obs.end(), obs_history_[h].begin() + offset, obs_history_[h].begin() + offset + len);
+
+  return obs;
 }
 
 std::array<float, WholeBodyRL::NUM_ACTIONS> WholeBodyRL::RunInference()
@@ -780,12 +1055,22 @@ std::array<float, WholeBodyRL::NUM_ACTIONS> WholeBodyRL::RunInference()
   } 
   catch (const std::exception& e) 
   {
-    std::cerr << "Inference failed: " << e.what() << std::endl;
+    std::cerr << "Inference failed: " << e.what() << " -> Change to Damping mode!" << std::endl;
+    state_ = State::DAMPING_STATE;
+    should_exit_ = true;
+    return rl_action_;  // hold the last action for the remaining frame
   }
 
   // process the output tensor
   float* output_data = output_tensors[0].GetTensorMutableData<float>();
   size_t output_size = output_tensors[0].GetTensorTypeAndShapeInfo().GetElementCount();
+  if (output_size < NUM_ACTIONS)
+  {
+    std::cerr << "Inference output size " << output_size << " < NUM_ACTIONS -> Change to Damping mode!" << std::endl;
+    state_ = State::DAMPING_STATE;
+    should_exit_ = true;
+    return rl_action_;
+  }
 
   // convert output data to vector
   std::vector<float> result(output_data, output_data + output_size);

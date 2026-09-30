@@ -9,3 +9,5 @@ logs/
 *.npz
 *.npy
 *.swp
+# ONNX Runtime prebuilt fetched by scripts/get_onnxruntime.sh
+thirdparty/onnxruntime-linux-*
