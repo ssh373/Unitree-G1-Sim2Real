@@ -104,6 +104,9 @@ void WholeBodyRL::InitSubscriber()
 
   imutorso_subscriber_.reset(new ChannelSubscriber<IMUState_>(HG_IMU_TORSO));
   imutorso_subscriber_->InitChannel(std::bind(&WholeBodyRL::imuTorsoHandler, this, std::placeholders::_1), 1);
+
+  bms_subscriber_.reset(new ChannelSubscriber<BmsState_>(HG_BMS_TOPIC));
+  bms_subscriber_->InitChannel(std::bind(&WholeBodyRL::BmsHandler, this, std::placeholders::_1), 1);
 }
 
 
@@ -174,7 +177,8 @@ void WholeBodyRL::LoggerThread()
            << ",roll,pitch,yaw"             // pelvis IMU orientation
            << ",gyro_x,gyro_y,gyro_z"       // pelvis IMU angular rate
            << ",fsm_state"                  // 0 wait_init, 1 moving, 2 wait_policy, 3 rl_active, 4 damping
-           << ",clamp_mask";                // bit i set if motor i hit the torque clamp since the last row
+           << ",clamp_mask"                 // bit i set if motor i hit the torque clamp since the last row
+           << ",bms_soc,bms_vol,bms_current,bms_temp,bms_cycle";  // battery; empty if rt/lf/bmsstate never arrived
   log_file << "\n";
   log_file.flush();
 
@@ -200,6 +204,11 @@ void WholeBodyRL::LoggerThread()
       else    log_file << ",,,,,,";
       log_file << "," << static_cast<int>(state_)
                << "," << clamp_mask_.exchange(0, std::memory_order_relaxed);
+
+      const auto bms = bms_buffer_.GetData();
+      if (bms) log_file << "," << static_cast<int>(bms->soc) << "," << bms->voltage
+                        << "," << bms->current << "," << bms->temp_max << "," << bms->cycle;
+      else     log_file << ",,,,,";
       log_file << "\n";
       log_file.flush();
     }
@@ -536,12 +545,33 @@ void WholeBodyRL::LowStateHandler(const void *message)
   }
 }
 
-void WholeBodyRL::imuTorsoHandler(const void *message) 
+void WholeBodyRL::imuTorsoHandler(const void *message)
 {
   IMUState_ imu_torso = *(const IMUState_ *)message;
   auto &rpy = imu_torso.rpy();
   // if (counter_ % 500 == 0)
   //   printf("IMU.torso.rpy: %.2f %.2f %.2f\n", rpy[0], rpy[1], rpy[2]);
+}
+
+void WholeBodyRL::BmsHandler(const void *message)
+{
+  const BmsState_ &bms = *(const BmsState_ *)message;
+
+  BmsData d;
+  d.soc = bms.soc();
+  d.current = bms.current();
+  d.cycle = bms.cycle();
+
+  // pack voltage: sum of the populated cell voltages [mV]; unused slots read 0
+  float v_mv = 0.0f;
+  for (uint16_t c : bms.cell_vol()) v_mv += c;
+  d.voltage = v_mv * 1e-3f;
+
+  // hottest sensor; unused slots read 0, so only populated ones are considered
+  for (int16_t t : bms.temperature())
+    if (t != 0) d.temp_max = std::max(d.temp_max, t);
+
+  bms_buffer_.SetData(d);
 }
 
 

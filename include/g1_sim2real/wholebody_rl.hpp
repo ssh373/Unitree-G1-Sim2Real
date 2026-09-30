@@ -41,6 +41,7 @@
 #include <unitree/idl/hg/IMUState_.hpp>
 #include <unitree/idl/hg/LowCmd_.hpp>
 #include <unitree/idl/hg/LowState_.hpp>
+#include <unitree/idl/hg/BmsState_.hpp>
 #include <unitree/robot/b2/motion_switcher/motion_switcher_client.hpp>
 
 // yaml-cpp
@@ -60,6 +61,7 @@
 static const std::string HG_CMD_TOPIC = "rt/lowcmd";
 static const std::string HG_IMU_TORSO = "rt/secondary_imu";
 static const std::string HG_STATE_TOPIC = "rt/lowstate";
+static const std::string HG_BMS_TOPIC = "rt/lf/bmsstate";
 
 // namespace
 using namespace unitree::common;
@@ -116,6 +118,7 @@ class WholeBodyRL {
   // Robot state subscriber
   ChannelSubscriberPtr<LowState_> lowstate_subscriber_;
   ChannelSubscriberPtr<IMUState_> imutorso_subscriber_;
+  ChannelSubscriberPtr<BmsState_> bms_subscriber_;
 
   // Threads
   ThreadPtr command_writer_ptr_, control_thread_ptr_;
@@ -362,6 +365,7 @@ class WholeBodyRL {
   // DDS Callback functions
   void LowStateHandler(const void *message);
   void imuTorsoHandler(const void *message);
+  void BmsHandler(const void *message);
 
   // DDS Command Writer function
   void LowCommandWriter();
@@ -435,6 +439,19 @@ class WholeBodyRL {
     std::array<float, 4> quat = {};
   };
 
+  /* Battery snapshot from rt/lf/bmsstate (published at low frequency). Logged so a recording
+     shows the pack condition next to the joint traces: a policy that looks weaker than last
+     week may just be running on a sagging pack. Empty columns mean the topic never arrived
+     (e.g. in simulation). */
+  struct BmsData
+  {
+    uint8_t soc = 0;        // state of charge [%]
+    float voltage = 0.0f;   // pack voltage [V], sum of the reported cell voltages
+    int32_t current = 0;    // pack current as reported by the BMS (negative = discharging)
+    int16_t temp_max = 0;   // hottest reported sensor [C]
+    uint16_t cycle = 0;     // charge cycle count
+  };
+
   // YAML config
   YamlConfig cfg;
 
@@ -442,6 +459,7 @@ class WholeBodyRL {
   g1_sim2real::DataBuffer<MotorCommand> motor_command_buffer_;
   g1_sim2real::DataBuffer<MotorState> motor_state_buffer_;
   g1_sim2real::DataBuffer<ImuState> imu_state_buffer_;
+  g1_sim2real::DataBuffer<BmsData> bms_buffer_;
 };
 
 #endif  // WHOLEBODY_RL_HPP
